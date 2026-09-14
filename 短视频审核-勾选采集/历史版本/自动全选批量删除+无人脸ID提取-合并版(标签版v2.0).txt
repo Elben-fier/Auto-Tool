@@ -1,0 +1,828 @@
+// ==UserScript==
+// @name         短剧审核-批量判错删除+无人脸ID提取【合并版】
+// @namespace    https://github.com/elben-fier/short-drama-review
+// @version      1.0.0
+// @description  单浮窗双功能：①自动全选批量判错删除（循环直到删完）②无人脸/关键词/低分 key_id 提取到剪贴板（②需本地后端 127.0.0.1:5002）
+// @author       Auto
+// @match        https://tools.vobile.cn/quality/qualityTest*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
+// @connect      *
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    console.log('[审核工具箱] 合并版已加载');
+
+    // =====================================================================
+    // 共享工具函数
+    // =====================================================================
+    const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // 安全点击：元素必须仍在 DOM 中，包裹 try-catch，避免 React 渲染竞争报错中断脚本
+    function safeClick(el) {
+        if (!el || !el.isConnected) return false;
+        try { el.click(); return true; }
+        catch (e) { console.warn('[工具箱] 点击失败:', e.message || e); return false; }
+    }
+
+    // 元素是否可见（参照短剧审核4.5 用 getComputedStyle 判断，比 offsetParent 可靠）
+    function isVisible(el) {
+        if (!el || !el.isConnected) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        return true;
+    }
+
+    // 抑制 antd 固定列渲染竞态导致的 insertBefore 报错（良性，避免刷屏/中断）
+    function setupErrorSuppression() {
+        window.addEventListener('error', (e) => {
+            if (e && e.message && e.message.indexOf('insertBefore') !== -1) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+        }, true);
+    }
+
+    // =====================================================================
+    // 模块一：自动全选批量判错删除（参照短剧审核4.5 的按钮/弹窗定位逻辑）
+    // =====================================================================
+    const DEL_CONFIG = {
+        // 批量按钮文字（页面实际按钮为「批量错误」，按优先级依次尝试）
+        batchBtnTexts: ['批量错误', '批量删除'],
+        modalWaitMax: 5000,        // 确认弹窗最长等待(ms)
+        batchBtnWaitMax: 8000,     // 批量按钮出现最长等待(ms)
+        afterActionDelay: 2500,    // 点击确认后的固定等待(ms)
+        refreshWaitMax: 15000,     // 表格刷新稳定最长等待(ms)
+        nextBatchWaitMax: 20000,   // 批量处理后等待下一批数据(ms)
+        tableWaitMax: 20000,       // 表格稳定最长等待(ms)
+        checkInterval: 400,        // 轮询间隔(ms)
+    };
+
+    const delState = {
+        running: false,
+        roundCount: 0,
+    };
+
+    const DEL_SEL = {
+        row: 'tr.ant-table-row.ant-table-row-level-0',
+        selectAll: '.ant-table-thead input.ant-checkbox-input',
+        batchBtn: 'button.ant-btn',
+        anyBtn: '.ant-btn',
+        anyButton: 'button',
+    };
+
+    function logDel(msg) {
+        console.log('[批量删除] ' + msg);
+        const el = document.querySelector('#del-log');
+        if (!el) return;
+        const line = document.createElement('div');
+        line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+        el.prepend(line);
+        while (el.children.length > 200) el.lastChild.remove();
+    }
+
+    // 批量按钮定位：按优先级在工具栏/表格容器/全文档中查找
+    // requireEnabled=true 时只返回「可见且未禁用」的按钮
+    function findBatchButton(requireEnabled) {
+        const roots = [
+            document.querySelector('.ant-pro-table-list-toolbar'),
+            document.querySelector('.ant-table-toolbar'),
+            document.querySelector('.ant-table-container'),
+            document.querySelector('.ant-table-wrapper'),
+            document,
+        ].filter(Boolean);
+
+        const selectors = [DEL_SEL.batchBtn, DEL_SEL.anyBtn, DEL_SEL.anyButton];
+
+        for (const root of roots) {
+            for (const text of DEL_CONFIG.batchBtnTexts) {
+                const needle = (text || '').replace(/\s+/g, '');
+                for (const selector of selectors) {
+                    const elements = (root || document).querySelectorAll(selector);
+                    for (const el of elements) {
+                        if (!el.isConnected) continue;
+                        const txt = (el.textContent || '').replace(/\s+/g, '');
+                        if (!txt.includes(needle)) continue;
+                        if (!isVisible(el)) continue;
+                        if (requireEnabled && el.disabled) continue;
+                        return el;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // 等待批量按钮出现（批量处理后工具栏可能重渲染；按钮可能短暂处于禁用状态）
+    async function waitForBatchButton(timeout) {
+        const start = Date.now();
+        let sawDisabled = false;
+        while (Date.now() - start < timeout) {
+            if (!delState.running) return null;
+            const btn = findBatchButton(true);
+            if (btn) return btn;
+            if (findBatchButton(false)) sawDisabled = true;
+            await delay(DEL_CONFIG.checkInterval);
+        }
+        if (sawDisabled) logDel('批量按钮存在但一直处于禁用状态（请检查是否勾选成功）');
+        return null;
+    }
+
+    // 确认按钮文字判定：确定/确认/删除 或 与批量按钮同名，且不是「取消」
+    function isConfirmText(txt) {
+        if (txt.includes('取消')) return false;
+        if (txt.includes('确定') || txt.includes('确认') || txt.includes('删除')) return true;
+        for (const t of DEL_CONFIG.batchBtnTexts) {
+            if (txt.includes(t)) return true;
+        }
+        return false;
+    }
+
+    // 确认弹窗定位（参照短剧审核4.5：ant-popconfirm 优先）
+    async function waitForConfirmBtn(timeout) {
+        const startTime = Date.now();
+        let debugDone = false;
+
+        while (Date.now() - startTime < timeout) {
+            // 策略1: ant-popconfirm 内的按钮（vobile 实际使用的组件）
+            const popconfirms = document.querySelectorAll('.ant-popconfirm');
+            for (const pc of popconfirms) {
+                if (!pc.isConnected) continue;
+                const style = window.getComputedStyle(pc);
+                if (style.display === 'none' || style.opacity === '0') continue;
+                const btns = pc.querySelectorAll('button');
+                for (const btn of btns) {
+                    const txt = (btn.textContent || '').replace(/\s+/g, '');
+                    if (isConfirmText(txt)) {
+                        if (!debugDone) console.log('[弹窗定位] ant-popconfirm 内找到按钮, class:', btn.className);
+                        return btn;
+                    }
+                }
+            }
+
+            // 策略2: ant-modal 内的 primary 按钮
+            const modals = document.querySelectorAll('.ant-modal-wrap, .ant-modal');
+            for (const modal of modals) {
+                if (!modal.isConnected) continue;
+                const style = window.getComputedStyle(modal);
+                if (style.display === 'none') continue;
+                const btns = modal.querySelectorAll('button.ant-btn-primary');
+                for (const btn of btns) {
+                    const txt = (btn.textContent || '').replace(/\s+/g, '');
+                    if (isConfirmText(txt)) {
+                        if (!debugDone) console.log('[弹窗定位] ant-modal 内找到按钮');
+                        return btn;
+                    }
+                }
+            }
+
+            // 首次扫描调试：输出页面所有疑似批量按钮，方便排查「找不到按钮」
+            if (!debugDone) {
+                const hits = [];
+                const all = document.querySelectorAll(DEL_SEL.anyButton);
+                for (const b of all) {
+                    const txt = (b.textContent || '').replace(/\s+/g, '');
+                    if (DEL_CONFIG.batchBtnTexts.some((t) => txt.includes(t))) {
+                        hits.push('"' + b.textContent.trim() + '" disabled=' + b.disabled + ' visible=' + isVisible(b) + ' class=' + b.className);
+                    }
+                }
+                if (hits.length > 0) console.log('[调试] 页面匹配到的批量按钮候选:', hits);
+                else console.log('[调试] 页面未找到包含「' + DEL_CONFIG.batchBtnTexts.join('/') + '」文字的任何按钮');
+            }
+            debugDone = true;
+
+            await delay(200);
+        }
+        console.warn('[弹窗定位] 超时，未找到确认按钮');
+        return null;
+    }
+
+    // 全选当前页
+    function selectAllRows() {
+        const selectAll = document.querySelector(DEL_SEL.selectAll);
+        if (!selectAll || !selectAll.isConnected) {
+            logDel('未找到表头全选框');
+            return false;
+        }
+        if (!selectAll.checked) safeClick(selectAll);
+        return true;
+    }
+
+    // 点击批量按钮 + 确认弹窗
+    async function clickBatchDelete() {
+        const batchBtn = await waitForBatchButton(DEL_CONFIG.batchBtnWaitMax);
+        if (!batchBtn) {
+            logDel('未找到「' + DEL_CONFIG.batchBtnTexts.join('」/「') + '」按钮（可用「测试定位按钮」排查）');
+            return false;
+        }
+        if (batchBtn.disabled) {
+            logDel('批量按钮已禁用（可能无勾选项）');
+            return false;
+        }
+
+        logDel('点击「' + batchBtn.textContent.trim() + '」按钮');
+        safeClick(batchBtn);
+        await delay(800);
+
+        const confirmBtn = await waitForConfirmBtn(DEL_CONFIG.modalWaitMax);
+        if (confirmBtn) {
+            logDel('确认弹窗按钮已找到，执行点击');
+            // 增强点击：同时触发 click + mousedown/mouseup，适配 React 弹窗
+            confirmBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+            safeClick(confirmBtn);
+            confirmBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+            await delay(DEL_CONFIG.afterActionDelay);
+            return true;
+        }
+        logDel('未找到确认弹窗按钮');
+        return false;
+    }
+
+    // 等待表格稳定
+    async function waitForTableSettled(timeout, stableMs) {
+        const start = Date.now();
+        const t = timeout || DEL_CONFIG.tableWaitMax;
+        const stable = stableMs || 1200;
+        let lastCount = document.querySelectorAll(DEL_SEL.row).length;
+        let stableSince = Date.now();
+        while (Date.now() - start < t) {
+            if (!delState.running) break;
+            await delay(400);
+            const count = document.querySelectorAll(DEL_SEL.row).length;
+            if (count === lastCount) {
+                if (Date.now() - stableSince >= stable) return count;
+            } else {
+                lastCount = count;
+                stableSince = Date.now();
+            }
+        }
+        return document.querySelectorAll(DEL_SEL.row).length;
+    }
+
+    // 等待下一批数据（批量处理后系统刷新）
+    async function waitForNextBatch(beforeCount, beforeFirstKey, timeout) {
+        const t = timeout || DEL_CONFIG.nextBatchWaitMax;
+        const start = Date.now();
+        while (Date.now() - start < t) {
+            if (!delState.running) return 0;
+            const rows = document.querySelectorAll(DEL_SEL.row);
+            const count = rows.length;
+            const firstKey = count > 0 ? rows[0].getAttribute('data-row-key') : null;
+            // 数据「变化」= 表格被清空 / 行数变化 / 首行 key 变化
+            const changed = count === 0 || count !== beforeCount || firstKey !== beforeFirstKey;
+            if (changed && count > 0) {
+                await waitForTableSettled(DEL_CONFIG.refreshWaitMax, 1200);
+                return document.querySelectorAll(DEL_SEL.row).length;
+            }
+            await delay(400);
+        }
+        return 0;
+    }
+
+    // 删除主循环
+    async function runDeleteLoop() {
+        let completed = false;
+        while (delState.running) {
+            try {
+                // 等表格稳定（上一轮处理后的刷新）
+                await waitForTableSettled(DEL_CONFIG.tableWaitMax, 1200);
+                if (!delState.running) break;
+
+                const rows = document.querySelectorAll(DEL_SEL.row);
+                if (rows.length === 0) {
+                    logDel('已无数据，全部删除完成');
+                    completed = true;
+                    break;
+                }
+
+                logDel('当前 ' + rows.length + ' 条数据，全选...');
+                if (!selectAllRows()) {
+                    logDel('全选失败，停止');
+                    break;
+                }
+                await delay(500);
+
+                // 记录处理前的表格快照，用于判断「下一批」
+                const beforeCount = document.querySelectorAll(DEL_SEL.row).length;
+                const firstRow = document.querySelector(DEL_SEL.row);
+                const beforeFirstKey = firstRow ? firstRow.getAttribute('data-row-key') : null;
+
+                const ok = await clickBatchDelete();
+                if (!ok) {
+                    logDel('批量处理未成功，停止');
+                    break;
+                }
+
+                delState.roundCount++;
+                logDel('第 ' + delState.roundCount + ' 轮处理完成，等待系统刷新下一批数据...');
+                updateDelPanel();
+
+                // 等待下一批数据（20s 内无变化则判定处理完成）
+                const nextCount = await waitForNextBatch(beforeCount, beforeFirstKey, DEL_CONFIG.nextBatchWaitMax);
+                if (!delState.running) break;
+
+                const remaining = document.querySelectorAll(DEL_SEL.row).length;
+                if (nextCount === 0 && remaining === 0) {
+                    logDel('20 秒内未出现新数据，判定处理完成');
+                    completed = true;
+                    break;
+                }
+                if (nextCount === 0) {
+                    logDel('未检测到数据变化，3 秒后重试当前页');
+                    await delay(3000);
+                    continue;
+                }
+                logDel('下一批数据已加载，当前 ' + nextCount + ' 条');
+            } catch (e) {
+                console.error('[批量删除] 本轮异常:', e);
+                logDel('本轮异常: ' + (e.message || e) + '，3 秒后重试');
+                await delay(3000);
+            }
+        }
+        logDel(completed ? '===== 全部删除完成 =====' : '已手动停止');
+        stopDelete();
+        if (completed) alert('全部删除完成！共处理 ' + delState.roundCount + ' 轮');
+    }
+
+    function updateDelPanel() {
+        const el = document.querySelector('#del-round');
+        if (el) el.textContent = delState.roundCount;
+    }
+
+    // =====================================================================
+    // 模块二：无人脸ID提取（需本地后端 127.0.0.1:5002）
+    // =====================================================================
+    const EXT_CONFIG = {
+        backendUrl: "http://127.0.0.1:5002",
+        batchSize: 3,            // 每批同时检测的图片数
+        nameKeywords: [],        // 关键词列表（第7列文本包含任一关键词则提取）
+        scoreThreshold: 80,      // 第8列分数低于该值则提取
+        pageWaitMax: 20000,      // 翻页最长等待时间(ms)
+        pageStayDelay: 1500,     // 点击下一页后先等待(ms)
+        renderSettleDelay: 3000, // 页码切换后额外等待渲染(ms)
+    };
+
+    const extState = {
+        running: false,
+        noFaceIds: new Set(),
+        currentPage: 1,
+        totalRows: 0,   // 当前页总行数
+        currentRow: 0,  // 当前页已处理到第几条
+    };
+
+    const EXT_SEL = {
+        row: "tr.ant-table-row.ant-table-row-level-0",
+        image: ".ant-image-img",
+        nameCell: "td:nth-child(7) .commonText-gqPoHv",   // 第7列：文本（用于关键词筛选）
+        scoreCell: "td:nth-child(8) .commonText-gqPoHv",  // 第8列：分数
+        keyIdCell: "td:nth-child(15) .commonText-gqPoHv",  // 第15列：key_id
+        nextPageBtn: "li.ant-pagination-next > button",
+        nextPageDisabled: "li.ant-pagination-next.ant-pagination-disabled",
+        activePageItem: "li.ant-pagination-item-active",
+    };
+
+    function logExt(msg) {
+        console.log("[无人脸提取] " + msg);
+        const el = document.querySelector('#no-face-log');
+        if (!el) return;
+        const line = document.createElement('div');
+        line.textContent = "[" + new Date().toLocaleTimeString() + "] " + msg;
+        el.prepend(line);
+        while (el.children.length > 200) el.lastChild.remove();
+    }
+
+    // ========== HTTP ==========
+    function apiPost(path, body) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: EXT_CONFIG.backendUrl + path,
+                headers: { "Content-Type": "application/json" },
+                data: JSON.stringify(body),
+                timeout: 20000,
+                onload(r) {
+                    if (r.status === 429) {
+                        setTimeout(() => apiPost(path, body).then(resolve).catch(reject), 600);
+                        return;
+                    }
+                    try { resolve(JSON.parse(r.responseText)); }
+                    catch (e) { reject(e); }
+                },
+                onerror: () => reject(new Error("请求失败")),
+                ontimeout: () => reject(new Error("请求超时")),
+            });
+        });
+    }
+
+    // ========== 图片下载 + 批量人脸检测 ==========
+    function downloadImageAsBase64(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: url,
+                responseType: "arraybuffer",
+                timeout: 15000,
+                onload(r) {
+                    if (r.status !== 200) { reject(new Error("HTTP " + r.status)); return; }
+                    try {
+                        const bytes = new Uint8Array(r.response);
+                        let binary = "";
+                        const chunk = 0x8000;
+                        for (let i = 0; i < bytes.length; i += chunk) {
+                            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+                        }
+                        resolve(btoa(binary));
+                    } catch (e) { reject(e); }
+                },
+                onerror: () => reject(new Error("下载失败")),
+                ontimeout: () => reject(new Error("下载超时")),
+            });
+        });
+    }
+
+    // 批量检测人脸，返回与 items 对齐的布尔数组（true=有人脸）
+    async function detectFacesBatch(items) {
+        const results = new Array(items.length).fill(false);
+
+        const downloads = await Promise.all(items.map(it =>
+            it.url ? downloadImageAsBase64(it.url).catch(() => null) : Promise.resolve(null)
+        ));
+
+        const okIdx = [], okB64 = [];
+        downloads.forEach((b64, i) => { if (b64) { okIdx.push(i); okB64.push(b64); } });
+
+        if (okB64.length > 0) {
+            try {
+                const res = await apiPost("/detect_batch", { images: okB64 });
+                const arr = Array.isArray(res.results) ? res.results : [];
+                arr.forEach((hasFace, j) => { results[okIdx[j]] = (hasFace === true); });
+            } catch (e) {
+                console.warn("[无人脸提取] 批量检测请求失败:", e.message || e);
+            }
+        }
+        return results;
+    }
+
+    // ========== 关键词筛选 ==========
+    function matchKeyword(name) {
+        if (!EXT_CONFIG.nameKeywords || EXT_CONFIG.nameKeywords.length === 0) return false;
+        return EXT_CONFIG.nameKeywords.some(kw => kw && name.includes(kw));
+    }
+
+    // ========== 分页 ==========
+    const getActivePage = () => {
+        const el = document.querySelector(EXT_SEL.activePageItem);
+        return el ? parseInt(el.textContent.trim(), 10) : NaN;
+    };
+
+    const getFirstRowKeyId = () => {
+        const row = document.querySelector(EXT_SEL.row);
+        if (!row) return null;
+        const el = row.querySelector(EXT_SEL.keyIdCell);
+        return el ? el.textContent.trim() : null;
+    };
+
+    async function waitForPage(targetPage, beforeKeyId) {
+        const start = Date.now();
+        while (Date.now() - start < EXT_CONFIG.pageWaitMax) {
+            const activePage = getActivePage();
+            const firstKeyId = getFirstRowKeyId();
+            const keyChanged = beforeKeyId !== null && firstKeyId !== null && firstKeyId !== beforeKeyId;
+            const changed = (!isNaN(activePage) && activePage === targetPage) || keyChanged;
+            if (changed) {
+                // 页码已切换，额外等待渲染完整
+                await delay(EXT_CONFIG.renderSettleDelay);
+                // 再等表格行数出现并稳定，避免数据未加载全
+                const settleStart = Date.now();
+                let last = document.querySelectorAll(EXT_SEL.row).length;
+                while (Date.now() - settleStart < 5000) {
+                    await delay(400);
+                    const cur = document.querySelectorAll(EXT_SEL.row).length;
+                    if (cur > 0 && cur === last) break;
+                    last = cur;
+                }
+                return true;
+            }
+            await delay(300);
+        }
+        throw new Error("第" + targetPage + "页加载超时");
+    }
+
+    async function goNextPage() {
+        if (document.querySelector(EXT_SEL.nextPageDisabled)) return false;
+        const nextBtn = document.querySelector(EXT_SEL.nextPageBtn);
+        if (!nextBtn || nextBtn.disabled) return false;
+        const targetPage = extState.currentPage + 1;
+        const beforeKeyId = getFirstRowKeyId();
+        nextBtn.click();
+        await delay(EXT_CONFIG.pageStayDelay);
+        await waitForPage(targetPage, beforeKeyId);
+        extState.currentPage = targetPage;
+        return true;
+    }
+
+    // ========== 核心采集 ==========
+    async function collectCurrentPage() {
+        const rows = document.querySelectorAll(EXT_SEL.row);
+        if (rows.length === 0) return 0;
+
+        extState.totalRows = rows.length;
+        extState.currentRow = 0;
+
+        const items = [];
+        rows.forEach(row => {
+            const keyIdEl = row.querySelector(EXT_SEL.keyIdCell);
+            const nameEl = row.querySelector(EXT_SEL.nameCell);
+            const scoreEl = row.querySelector(EXT_SEL.scoreCell);
+            const img = row.querySelector(EXT_SEL.image);
+            const keyId = keyIdEl ? keyIdEl.textContent.trim() : "";
+            const name = nameEl ? nameEl.textContent.trim() : "";
+            const score = scoreEl ? parseFloat(scoreEl.textContent.trim()) : NaN;
+            const url = img ? (img.currentSrc || img.src || "") : "";
+            if (keyId) items.push({ keyId, name, url, score });
+        });
+
+        let addCount = 0;
+        for (let i = 0; i < items.length; i += EXT_CONFIG.batchSize) {
+            if (!extState.running) break;
+            const batch = items.slice(i, i + EXT_CONFIG.batchSize);
+
+            const faceResults = await detectFacesBatch(batch);
+
+            batch.forEach((it, j) => {
+                const hasFace = faceResults[j] === true;
+                const nameMatch = matchKeyword(it.name);
+                const scoreLow = !isNaN(it.score) && it.score < EXT_CONFIG.scoreThreshold;
+                // 提取条件：无人脸 或 第7列文本含关键词 或 第8列分数低于阈值
+                if (!hasFace || nameMatch || scoreLow) {
+                    if (!extState.noFaceIds.has(it.keyId)) addCount++;
+                    extState.noFaceIds.add(it.keyId);
+                }
+            });
+
+            // 更新进度
+            extState.currentRow = Math.min(i + batch.length, items.length);
+            updateExtractPanel();
+        }
+
+        return addCount;
+    }
+
+    async function runExtract() {
+        const start = Date.now();
+        while (Date.now() - start < EXT_CONFIG.pageWaitMax) {
+            if (document.querySelectorAll(EXT_SEL.row).length > 0) break;
+            await delay(300);
+        }
+
+        while (extState.running) {
+            const add = await collectCurrentPage();
+            logExt("第" + extState.currentPage + "页完成，本页新增 " + add + " 条，累计 " + extState.noFaceIds.size + " 条");
+            updateExtractPanel();
+
+            try {
+                const hasNext = await goNextPage();
+                if (!hasNext) {
+                    const result = Array.from(extState.noFaceIds).join(',');
+                    GM_setClipboard(result);
+                    logExt("全部完成！共 " + extState.noFaceIds.size + " 条 key_id 已复制到剪贴板");
+                    break;
+                }
+            } catch (e) {
+                logExt("翻页异常: " + (e.message || e));
+                break;
+            }
+        }
+        stopExtract();
+    }
+
+    function updateExtractPanel() {
+        const c = document.querySelector("#nf-count");
+        const p = document.querySelector("#nf-page");
+        const prog = document.querySelector("#nf-progress");
+        if (c) c.textContent = extState.noFaceIds.size;
+        if (p) p.textContent = extState.currentPage;
+        if (prog) prog.textContent = extState.currentRow + " / " + extState.totalRows;
+        const btn = document.querySelector("#nf-copy");
+        if (btn) btn.disabled = extState.noFaceIds.size === 0;
+    }
+
+    // =====================================================================
+    // 合并面板（单浮窗 + 两个标签页）
+    // =====================================================================
+    function buildPanel() {
+        if (document.querySelector('#tool-panel')) return;
+
+        const panel = document.createElement('div');
+        panel.id = 'tool-panel';
+        panel.innerHTML = `
+            <div class="tool-title" id="tool-title">短剧审核工具箱</div>
+            <div class="tool-tabs">
+                <button class="tool-tab active" data-tab="del">批量判错删除</button>
+                <button class="tool-tab" data-tab="ext">无人脸ID提取</button>
+            </div>
+            <div class="tool-body">
+                <!-- 标签一：批量判错删除 -->
+                <div class="tab-content" id="tab-del">
+                    <div class="del-stat">已处理轮次：<b id="del-round">0</b></div>
+                    <div class="tool-row">
+                        <button id="del-start" class="tool-btn del-go">开始删除</button>
+                        <button id="del-test" class="tool-btn del-test">测试定位按钮</button>
+                        <button id="del-stop" class="tool-btn del-stop" disabled>停止</button>
+                    </div>
+                    <div class="tool-tip">每轮：全选 → 批量错误 → 确认 → 等下一批 → 直到删完（20秒无新数据停止）<br>按钮定位失败时先点「测试定位按钮」看日志</div>
+                    <div class="tool-log" id="del-log"></div>
+                </div>
+                <!-- 标签二：无人脸ID提取 -->
+                <div class="tab-content" id="tab-ext" style="display:none">
+                    <div class="nf-stat">当前页：第 <b id="nf-progress">0 / 0</b> 条</div>
+                    <div class="nf-stat">页码：<b id="nf-page">1</b> &nbsp;|&nbsp; 已提取：<b id="nf-count">0</b> 条</div>
+                    <div class="tool-row">
+                        <label class="nf-label">关键词：</label>
+                        <input type="text" id="nf-keyword" placeholder="逗号分隔，留空不启用">
+                    </div>
+                    <div class="tool-row">
+                        <label class="nf-label">分数低于：</label>
+                        <input type="number" id="nf-score" value="80" min="0" max="100" step="1">
+                    </div>
+                    <div class="tool-row">
+                        <button id="nf-start" class="tool-btn nf-go">开始提取</button>
+                        <button id="nf-stop" class="tool-btn nf-stop" disabled>停止</button>
+                    </div>
+                    <button id="nf-copy" class="tool-btn nf-copy" disabled>复制全部key_id</button>
+                    <div class="tool-tip">需本地后端 127.0.0.1:5002；提取规则：无人脸 或 名称含关键词 或 分数低于阈值</div>
+                    <div class="tool-log" id="no-face-log"></div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        const css = document.createElement('style');
+        css.textContent = `
+            #tool-panel{position:fixed;top:100px;right:20px;width:270px;background:#fff;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.15);z-index:999999;font-size:13px;font-family:system-ui,sans-serif;}
+            .tool-title{padding:10px 14px;background:#722ed1;color:#fff;border-radius:8px 8px 0 0;font-weight:600;cursor:move;user-select:none;}
+            .tool-tabs{display:flex;border-bottom:1px solid #f0f0f0;}
+            .tool-tab{flex:1;padding:8px 0;border:none;background:#fafafa;cursor:pointer;font-size:12px;color:#666;}
+            .tool-tab.active{background:#fff;color:#722ed1;font-weight:600;border-bottom:2px solid #722ed1;}
+            .tool-body{padding:12px 14px;}
+            .tool-row{display:flex;align-items:center;gap:6px;margin-bottom:8px;}
+            .tool-btn{flex:1;padding:6px 0;border:none;border-radius:4px;cursor:pointer;font-size:12px;}
+            .tool-btn:disabled{opacity:.45;cursor:not-allowed;}
+            .tool-tip{font-size:11px;color:#999;margin-bottom:8px;line-height:1.6;}
+            .tool-log{max-height:170px;overflow-y:auto;background:#fafafa;border-radius:4px;padding:6px 8px;font-size:11px;font-family:Consolas,monospace;line-height:1.6;color:#666;word-break:break-all;}
+            .tool-row input{flex:1;padding:4px 6px;border:1px solid #d9d9d9;border-radius:4px;outline:none;font-size:12px;}
+            #nf-score{flex:none;width:70px;}
+            .del-stat{margin-bottom:8px;color:#333;}
+            .del-stat b{color:#ff4d4f;font-size:16px;}
+            .del-go{background:#ff4d4f;color:#fff;}
+            .del-test{background:#fff7e6;color:#d46b08;border:1px solid #ffd591;font-size:11px;}
+            .del-stop{background:#f5f5f5;color:#333;border:1px solid #d9d9d9;}
+            .nf-stat{margin-bottom:8px;color:#333;}
+            .nf-stat b{color:#1677ff;font-size:15px;}
+            .nf-label{font-size:12px;color:#666;white-space:nowrap;}
+            .nf-go{background:#1677ff;color:#fff;}
+            .nf-stop{background:#ff4d4f;color:#fff;}
+            .nf-copy{width:100%;background:#52c41a;color:#fff;margin-bottom:8px;}
+        `;
+        document.head.appendChild(css);
+
+        // 标签切换
+        const tabs = document.querySelectorAll('.tool-tab');
+        const switchTab = (tab) => {
+            tabs.forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            document.querySelector('#tab-del').style.display = tab.dataset.tab === 'del' ? '' : 'none';
+            document.querySelector('#tab-ext').style.display = tab.dataset.tab === 'ext' ? '' : 'none';
+        };
+        tabs.forEach(tab => tab.addEventListener('click', () => switchTab(tab)));
+
+        // 拖拽
+        let dragging = false, ox = 0, oy = 0;
+        const title = panel.querySelector('#tool-title');
+        title.addEventListener('mousedown', (e) => {
+            dragging = true;
+            const r = panel.getBoundingClientRect();
+            ox = e.clientX - r.left; oy = e.clientY - r.top;
+            panel.style.right = 'auto';
+            panel.style.left = r.left + 'px';
+            panel.style.top = r.top + 'px';
+            e.preventDefault();
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            panel.style.left = Math.max(0, Math.min(e.clientX - ox, window.innerWidth - panel.offsetWidth)) + 'px';
+            panel.style.top = Math.max(0, Math.min(e.clientY - oy, window.innerHeight - panel.offsetHeight)) + 'px';
+        });
+        document.addEventListener('mouseup', () => { dragging = false; });
+
+        // 删除模块事件
+        document.querySelector('#del-start').addEventListener('click', startDelete);
+        document.querySelector('#del-stop').addEventListener('click', stopDelete);
+        document.querySelector('#del-test').addEventListener('click', () => {
+            const btn = findBatchButton(true);
+            if (btn) {
+                logDel('✅ 找到批量按钮: "' + btn.textContent.trim() + '" class=' + btn.className + ' disabled=' + btn.disabled);
+                return;
+            }
+            logDel('❌ 未找到可用的批量按钮，页面候选按钮如下:');
+            const all = document.querySelectorAll(DEL_SEL.anyButton);
+            let n = 0;
+            for (const b of all) {
+                const txt = (b.textContent || '').replace(/\s+/g, '');
+                if (!txt || !(txt.includes('批量') || txt.includes('删除') || txt.includes('正确') || txt.includes('错误'))) continue;
+                logDel('  "' + b.textContent.trim() + '" disabled=' + b.disabled + ' visible=' + isVisible(b));
+                if (++n >= 20) break;
+            }
+        });
+
+        // 提取模块事件
+        document.querySelector('#nf-start').addEventListener('click', startExtract);
+        document.querySelector('#nf-stop').addEventListener('click', stopExtract);
+        document.querySelector('#nf-copy').addEventListener('click', () => {
+            const result = Array.from(extState.noFaceIds).join(',');
+            GM_setClipboard(result);
+            logExt("已复制 " + extState.noFaceIds.size + " 条 key_id 到剪贴板");
+        });
+    }
+
+    // ========== 删除模块控制 ==========
+    function startDelete() {
+        if (delState.running) return;
+        if (extState.running) {
+            logDel('无人脸提取正在运行，请先停止「无人脸ID提取」');
+            return;
+        }
+        delState.running = true;
+        delState.roundCount = 0;
+        document.querySelector('#del-start').disabled = true;
+        document.querySelector('#del-stop').disabled = false;
+        document.querySelector('#nf-start').disabled = true; // 互斥
+        updateDelPanel();
+        runDeleteLoop();
+    }
+
+    function stopDelete() {
+        delState.running = false;
+        const s = document.querySelector('#del-start');
+        const st = document.querySelector('#del-stop');
+        if (s) s.disabled = false;
+        if (st) st.disabled = true;
+        const ns = document.querySelector('#nf-start');
+        if (ns) ns.disabled = false;
+    }
+
+    // ========== 提取模块控制 ==========
+    function startExtract() {
+        if (extState.running) return;
+        if (delState.running) {
+            logExt('批量判错删除正在运行，请先停止「批量判错删除」');
+            return;
+        }
+        // 读取关键词输入
+        const kwVal = document.querySelector('#nf-keyword').value.trim();
+        EXT_CONFIG.nameKeywords = kwVal
+            ? kwVal.split(/[,，]/).map(k => k.trim()).filter(k => k)
+            : [];
+
+        // 读取分数阈值
+        const scoreVal = parseFloat(document.querySelector('#nf-score').value);
+        if (!isNaN(scoreVal)) EXT_CONFIG.scoreThreshold = scoreVal;
+
+        extState.running = true;
+        extState.noFaceIds.clear();
+        const startPage = getActivePage();
+        extState.currentPage = Number.isNaN(startPage) ? 1 : startPage;
+        extState.totalRows = 0;
+        extState.currentRow = 0;
+        document.querySelector('#nf-start').disabled = true;
+        document.querySelector('#nf-stop').disabled = false;
+        document.querySelector('#del-start').disabled = true; // 互斥
+        updateExtractPanel();
+        const ruleParts = ["无人脸", "分数<" + EXT_CONFIG.scoreThreshold];
+        if (EXT_CONFIG.nameKeywords.length > 0) ruleParts.push("关键词：" + EXT_CONFIG.nameKeywords.join("、"));
+        logExt("开始提取（第" + extState.currentPage + "页起），规则：" + ruleParts.join(" 或 "));
+        runExtract();
+    }
+
+    function stopExtract() {
+        extState.running = false;
+        const s = document.querySelector('#nf-start');
+        const st = document.querySelector('#nf-stop');
+        if (s) s.disabled = false;
+        if (st) st.disabled = true;
+        const ds = document.querySelector('#del-start');
+        if (ds) ds.disabled = false;
+    }
+
+    // ========== 初始化 ==========
+    setupErrorSuppression();
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', buildPanel);
+    } else {
+        buildPanel();
+    }
+})();

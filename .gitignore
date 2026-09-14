@@ -1,16 +1,26 @@
-# Windows
+# ===== 运行产物 =====
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# ===== 模型文件（体积较大，获取方式见 backend/README.md）=====
+*.onnx
+*.pt
+backend/haarcascade_frontalface_default.xml
+
+# ===== 后端调试截图 =====
+backend/debug_*.png
+backend/debug_screenshot_*.png
+
+# ===== 系统 / 编辑器 =====
 Thumbs.db
 Desktop.ini
 ehthumbs.db
-
-# macOS
 .DS_Store
-
-# IDE / 编辑器
 .idea/
 .vscode/
 *.swp
-
-# 日志与临时文件
-*.log
 tmp/
