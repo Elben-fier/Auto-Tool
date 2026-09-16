@@ -53,6 +53,8 @@
     parentScoreThreshold: 95,      // 匹配最高分(第5列)：相似 且 > 该值 → 直接全剧审核（不展开）
     judgeCode: '777',              // 需要展开时统计的子样本状态码（只有 777 算数，601 不算）
     correctCodeMinCount: 4,        // 状态码 = judgeCode 的条数 > 3（即 ≥ 该值）→ 模式1；否则模式2
+    noScoreStopCount: 3,           // 安全保护：连续多少行"匹配分读不到"就立即停止（0=关闭）
+                                   //   防第5列选择器失效时把整批合集误判为全错
     correctCodes: ['777', '601'],  // 9.1.0 起不再参与判定，仅用于日志/自检说明：这些码代表"前人已判定"
     wrongCode: '594',              // 判错完成标志（全选+批量错误后，子样本状态码 0 → 594）
     unjudgedCode: '0',             // 未判定
@@ -98,6 +100,7 @@
     processedCount: 0,
     mode1Count: 0,       // 直接全剧审核次数
     mode2Count: 0,       // 全选判错次数
+    noScoreStreak: 0,    // 连续多少行匹配分读不到（读到就清零；达到 noScoreStopCount 即停止）
     workIndex: 0,        // 当前工作行（0=第1行）
     skipIds: new Set(),  // 已永久跳过的合集id（本轮不再处理）
     skipList: [],        // 跳过明细：{id,name,reason,time}
@@ -940,6 +943,7 @@
 
   async function runLoop() {
     let done = false;
+    let abortReason = '';       // 9.1 保护：非正常停止的原因（连续读不到匹配分）
     while (state.running) {
       try {
         const target = pickTarget();
@@ -950,6 +954,25 @@
         }
 
         const R = target.R, meta = target.meta;
+
+        // ---- 9.1 安全保护：连续多行"匹配分读不到" → 疑似第5列选择器失效，立即停止 ----
+        // 目的：避免页面改版时把整批合集按"读不到→直接全错"误判掉
+        if (CONFIG.noScoreStopCount > 0) {
+          if (meta.score === null) {
+            state.noScoreStreak++;
+            log('⚠️ 第' + (target.idx + 1) + '行匹配分读不到（连续 ' + state.noScoreStreak + '/' +
+              CONFIG.noScoreStopCount + ' 行）');
+            if (state.noScoreStreak >= CONFIG.noScoreStopCount) {
+              abortReason = '连续 ' + state.noScoreStreak + ' 行读不到匹配分（第5列），疑似页面改版/选择器失效';
+              log('⛔ ' + abortReason + ' → 立即停止运行（本行未处理，请检查 SELECTORS.parentScoreCell）');
+              setStatus('⛔ ' + abortReason + '，已停止');
+              break;
+            }
+          } else {
+            state.noScoreStreak = 0;
+          }
+        }
+
         log('===== 处理 第' + (target.idx + 1) + '行 合集[' + meta.id + ']「' + meta.name +
           '」集数' + meta.episodes + ' 匹配分' + (meta.score === null ? '-' : meta.score) +
           (meta.isSlow ? '（慢处理）' : '') + ' =====');
@@ -996,8 +1019,13 @@
         await delay(3000);
       }
     }
-    setStatus(done ? '全部处理完成' : '已停止');
+    setStatus(abortReason ? ('⛔ 已停止：' + abortReason) : (done ? '全部处理完成' : '已停止'));
     stopRun();
+    if (!done && abortReason) {
+      setTimeout(() => alert('⚠️ 脚本已自动停止\n原因：' + abortReason +
+        '\n\n已处理 ' + state.processedCount + ' 个合集；本行及之后的行未处理。' +
+        '\n请按 F12 查看控制台「自检」输出，确认第5列（匹配分）选择器是否失效。'), 100);
+    }
     if (done) {
       const skipText = state.skipList.length > 0
         ? ('\n跳过 ' + state.skipList.length + ' 个合集（需人工处理）：\n' +
@@ -1104,6 +1132,7 @@
           ⑥ <b>不相似 且 匹配分 ≤ ${CONFIG.parentScoreThreshold}</b> → <b>直接全错</b>（不数 777，仍走全选判错）<br>
           相似判据：两列<b>连续 ${CONFIG.similarMinSubstr} 字相同</b>，或<b>公共不同字 ≥ ${CONFIG.similarMinCommonChars} 个</b>（状态码 ${CONFIG.judgeCode} 之外的码如 601 不参与计数）<br>
           <b>模式2</b> = 展开 + 全选 + 批量错误（等全部 ${CONFIG.wrongCode}）+ 全剧审核<br>
+          <b>安全保护</b>：连续 ${CONFIG.noScoreStopCount} 行匹配分读不到 → <b>自动停止运行</b>（防第5列选择器失效时整批被误判全错）<br>
           <b>等待/重试</b>：全剧审核是否完成<b>只看第2列合集id</b>（唯一）；等待期间第 ${CONFIG.retryAtSec.join('s / ')}s 各重试点击一次同一按钮（最多3次）；仍无响应 → <b>永久跳过该合集，换下一行继续</b><br>
           <b>严格等待</b>：每次点击前/展开后/提交后都等 antd 转圈消失；转圈期间不判定完成
         </div>
@@ -1191,6 +1220,7 @@
     state.processedCount = 0;
     state.mode1Count = 0;
     state.mode2Count = 0;
+    state.noScoreStreak = 0;
     state.skipIds = new Set();
     state.skipList = [];
     state.workIndex = CONFIG.startRow - 1;
@@ -1204,6 +1234,8 @@
       Math.round(CONFIG.loadingWaitMaxSlow / 1000) + 's');
     log('等待重试：第 ' + CONFIG.retryAtSec.join('s、') + 's 各重试点击一次（每按钮最多3次）；' +
       '仍无响应 → 永久跳过该合集换下一行（最多跳过 ' + CONFIG.maxSkipCount + ' 个）');
+    log('安全保护：连续 ' + CONFIG.noScoreStopCount + ' 行匹配分读不到 → 立即停止运行' +
+      (CONFIG.noScoreStopCount > 0 ? '' : '（当前已关闭）'));
     log('终极关键词（第3列命中即直接全错）：' + CONFIG.ultimateKeywords.join('、'));
     log('判定（9.1.0：相似度对所有文本生效）：⓪终极关键词→全错 ' +
       '①关键词仅第3列→全错 ②匹配分读不到→全错 ' +
