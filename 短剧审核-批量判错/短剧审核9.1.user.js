@@ -45,7 +45,7 @@
 (function () {
   'use strict';
 
-  console.log('[短剧审核8.0] 智能判定全剧审核版已加载');
+  console.log('[短剧审核9.1] 相似度矩阵版已加载');
 
   // ========== 可配置项 ==========
   const CONFIG = {
