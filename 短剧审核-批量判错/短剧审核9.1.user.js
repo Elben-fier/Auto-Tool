@@ -15,8 +15,8 @@
 //        ② 相似 且 匹配分 ≤ 95                  → 【展开合集】数状态码 777 的条数：
 //                                                 > 3 条（≥4）→ 模式1（全剧审核）；否则 → 模式2（全错）
 //        ③ 不相似 且 匹配分 > 95                → 【展开合集】同上判据（777 > 3 条 → 模式1；否则模式2）
-//        ④ 不相似 且 匹配分 ≤ 95                → 【模式2】直接全错（不展开）
-//        ⑤ 匹配分读不到                          → 【模式2】直接全错（不展开）
+//        ④ 不相似 且 匹配分 ≤ 95                → 【模式2】直接全错（不数 777，仍走全选判错）
+//        ⑤ 匹配分读不到                          → 【模式2】直接全错（不数 777，仍走全选判错）
 //  【优先级】终级关键词 → 关键词双列比对 → 上面这张相似度矩阵（关键词规则仍最优先）
 //  【与 9.0 的差异】
 //        · 相似度不再受"短剧名字数 ≤4"限制，所有行都比对
@@ -139,7 +139,7 @@
   }
 
   function log(msg) {
-    console.log('[短剧9.0] ' + msg);
+    console.log('[短剧9.1] ' + msg);
     const el = document.querySelector('#s9-log');
     if (!el) return;
     const line = document.createElement('div');
@@ -170,7 +170,7 @@
   function safeClick(el) {
     if (!el || !el.isConnected) return false;
     try { el.click(); return true; }
-    catch (e) { console.warn('[短剧9.0] 点击失败:', e.message || e); return false; }
+    catch (e) { console.warn('[短剧9.1] 点击失败:', e.message || e); return false; }
   }
 
   // ========== 严格等待加载完成（antd 转圈闸门） ==========
@@ -735,9 +735,9 @@
   // 判定优先级（9.1.0）：
   //   ⓪ 终极关键词命中第3列                    → 模式2（不执行后续判定）
   //   ① 关键词双列比对：第3列命中且第4列无同词  → 模式2
-  //   ② 匹配分读不到                            → 模式2（直接全错，不展开）
+  //   ② 匹配分读不到                            → 模式2（直接全错，不数 777）
   //   ③ 相似 且 匹配分 > 95                     → 模式1（不展开）
-  //   ④ 不相似 且 匹配分 ≤ 95                   → 模式2（直接全错，不展开）
+  //   ④ 不相似 且 匹配分 ≤ 95                   → 模式2（直接全错，不数 777）
   //   ⑤ 相似且 ≤95 ／ 不相似且 >95               → 展开：状态码 777 条数 > 3 → 模式1；否则模式2
   // 相似度判据（所有文本都比对）：连续 similarMinSubstr 字相同 或 公共不同字 ≥ similarMinCommonChars
   // 返回 { result: 'ok'|'problem', mode: 1|2, reason }
@@ -787,9 +787,9 @@
       reason = '两列相似 且 匹配分 ' + score + ' > ' + CONFIG.parentScoreThreshold +
         ' → 直接全剧审核（不展开）' + (kwr.dual ? '（关键词两列都有）' : '');
     } else if (!similar && score <= CONFIG.parentScoreThreshold) {
-      // ④ 不相似 且 匹配分 ≤ 95 → 直接全错（不展开）
+      // ④ 不相似 且 匹配分 ≤ 95 → 直接全错（不数 777；全错流程本身仍需展开去全选子样本）
       mode = 2;
-      reason = '两列不相似 且 匹配分 ' + score + ' ≤ ' + CONFIG.parentScoreThreshold + ' → 直接全错（不展开）';
+      reason = '两列不相似 且 匹配分 ' + score + ' ≤ ' + CONFIG.parentScoreThreshold + ' → 直接全错（不数 777，直接进全错流程）';
     } else {
       // ⑤ 其余两种情况都要展开数 777：相似但 ≤95 ／ 不相似但 >95
       needExpand = true;
@@ -991,7 +991,7 @@
         // 从下一行开始找目标（永久跳过当前合集）
         state.workIndex = target.idx + 1;
       } catch (e) {
-        console.error('[短剧9.0] 主循环异常:', e);
+        console.error('[短剧9.1] 主循环异常:', e);
         log('主循环异常: ' + (e.message || e) + '，3秒后继续');
         await delay(3000);
       }
@@ -1060,7 +1060,7 @@
     const panel = document.createElement('div');
     panel.id = 's9-panel';
     panel.innerHTML = `
-      <div class="p9-title" id="s9-title">短剧审核助手 9.0
+      <div class="p9-title" id="s9-title">短剧审核助手 9.1
         <button id="s9-min" class="p9-min" title="最小化/展开">—</button>
       </div>
       <div class="p9-statusline"><span id="s9-status">空闲</span></div>
@@ -1097,11 +1097,11 @@
           <b>9.1 判定（相似度 × 匹配分；所有文本都比对相似度）</b>：<br>
           ⓪ <b>终极关键词</b>（${CONFIG.ultimateKeywords.join('、')}）：第3列命中 → <b>直接全错</b>，不执行后续判定<br>
           ① 关键词双列比对：第3列命中且第4列也有同一词 → 继续判定；第4列没有 → <b>直接全错</b><br>
-          ② 匹配分读不到 → <b>直接全错</b>（不展开）<br>
+          ② 匹配分读不到 → <b>直接全错</b>（不数 777）<br>
           ③ <b>相似 且 匹配分 &gt; ${CONFIG.parentScoreThreshold}</b> → <b>模式1</b>：不展开，直接点「全剧审核」<br>
           ④ <b>相似 且 匹配分 ≤ ${CONFIG.parentScoreThreshold}</b> → <b>展开合集</b>：状态码 ${CONFIG.judgeCode} 的条数 &gt; ${CONFIG.correctCodeMinCount - 1} → <b>模式1</b>；否则 <b>模式2</b><br>
           ⑤ <b>不相似 且 匹配分 &gt; ${CONFIG.parentScoreThreshold}</b> → <b>展开合集</b>：状态码 ${CONFIG.judgeCode} 的条数 &gt; ${CONFIG.correctCodeMinCount - 1} → <b>模式1</b>；否则 <b>模式2</b><br>
-          ⑥ <b>不相似 且 匹配分 ≤ ${CONFIG.parentScoreThreshold}</b> → <b>直接全错</b>（不展开）<br>
+          ⑥ <b>不相似 且 匹配分 ≤ ${CONFIG.parentScoreThreshold}</b> → <b>直接全错</b>（不数 777，仍走全选判错）<br>
           相似判据：两列<b>连续 ${CONFIG.similarMinSubstr} 字相同</b>，或<b>公共不同字 ≥ ${CONFIG.similarMinCommonChars} 个</b>（状态码 ${CONFIG.judgeCode} 之外的码如 601 不参与计数）<br>
           <b>模式2</b> = 展开 + 全选 + 批量错误（等全部 ${CONFIG.wrongCode}）+ 全剧审核<br>
           <b>等待/重试</b>：全剧审核是否完成<b>只看第2列合集id</b>（唯一）；等待期间第 ${CONFIG.retryAtSec.join('s / ')}s 各重试点击一次同一按钮（最多3次）；仍无响应 → <b>永久跳过该合集，换下一行继续</b><br>
