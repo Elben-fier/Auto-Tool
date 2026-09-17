@@ -1,27 +1,36 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.1.0
-// @description  相似度×匹配分二维判定（所有文本都比对相似度）：相似且>95 → 直接全剧审核；相似且≤95 或 不相似且>95 → 展开按状态码777条数(>3)判定；不相似且≤95 / 匹配分读不到 → 直接全错；含终极关键词、关键词双列比对、30s/60s重试、永久跳过与严格等待加载
+// @version      9.1.1
+// @description  相似度×匹配分二维判定（所有文本都比对相似度）：相似且>95 → 直接全剧审核；相似且≤95 或 不相似且>95 → 展开按状态码 777 或 601 的条数（任一个>3）判定；不相似且≤95 / 匹配分读不到 → 直接全错；含终极关键词、关键词双列比对、30s/60s重试、永久跳过与严格等待加载
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
 // @grant        GM_setClipboard
 // @run-at       document-end
 // ==/UserScript==
 
+// ============================== 9.1.1 补充 ==============================
+//  【本次补充】展开后的判定由"只有 777 > 3 条"改为"777 > 3 条【或】601 > 3 条（两个码各自计数）"：
+//        · 展开后分别统计状态码 777 与 601 的条数
+//        · 任一个 > 3 条（即 ≥ 4）→ 【模式1】直接点「全剧审核」
+//        · 两个都不足 4 条        → 【模式2】全选 + 批量错误 + 全剧审核
+//        · 配置：judgeCodes: ['777', '601']（合并了原来的 correctCodes），阈值仍为 correctCodeMinCount: 4
+//        · 日志会分别打印「777 X 条 / 601 Y 条」，并在判定原因里写明是哪个码超限
+// ==========================================================================
+
 // ============================== 9.1.0 更新记录（相似度矩阵版） ==============================
 //  【本次要求】相似度对"所有文本"生效（不再限制短剧名 ≤4 字），并按 相似度 × 匹配分 二维判定：
 //        ① 相似 且 匹配分 > 95                  → 【模式1】不展开，直接点「全剧审核」
-//        ② 相似 且 匹配分 ≤ 95                  → 【展开合集】数状态码 777 的条数：
-//                                                 > 3 条（≥4）→ 模式1（全剧审核）；否则 → 模式2（全错）
-//        ③ 不相似 且 匹配分 > 95                → 【展开合集】同上判据（777 > 3 条 → 模式1；否则模式2）
-//        ④ 不相似 且 匹配分 ≤ 95                → 【模式2】直接全错（不数 777，仍走全选判错）
-//        ⑤ 匹配分读不到                          → 【模式2】直接全错（不数 777，仍走全选判错）
+//        ② 相似 且 匹配分 ≤ 95                  → 【展开合集】数状态码 777 / 601 的条数（各自计数）：
+//                                                 任一个 > 3 条 → 模式1（全剧审核）；都不足 → 模式2（全错）
+//        ③ 不相似 且 匹配分 > 95                → 【展开合集】同 ② 判据（777 或 601 各自 > 3 条 → 模式1；否则模式2）
+//        ④ 不相似 且 匹配分 ≤ 95                → 【模式2】直接全错（不数 777/601，仍走全选判错）
+//        ⑤ 匹配分读不到                          → 【模式2】直接全错（不数 777/601，仍走全选判错）
 //  【优先级】终级关键词 → 关键词双列比对 → 上面这张相似度矩阵（关键词规则仍最优先）
 //  【与 9.0 的差异】
 //        · 相似度不再受"短剧名字数 ≤4"限制，所有行都比对
 //        · 90~95 那一档的特殊判据取消：现在 ≤95 一侧统一"展开数 777"
-//        · 601 不参与判定（只有 777 算数）；删除配置 bandScoreMin / similarGateNameLen
+//        · 601 的计数规则见 9.1.1 补充（9.1.0 时只有 777 算数）；删除配置 bandScoreMin / similarGateNameLen
 //  【沿用】终极关键词、关键词双列比对、严格等待加载（转圈闸门）、30s/60s 重试、
 //          永久跳过（换下一行）、只用第2列 id 判断全剧审核完成
 // ==========================================================================
@@ -51,11 +60,10 @@
   const CONFIG = {
     // —— 模式判定（9.1.0：相似度 × 匹配分 二维判定）——
     parentScoreThreshold: 95,      // 匹配最高分(第5列)：相似 且 > 该值 → 直接全剧审核（不展开）
-    judgeCode: '777',              // 需要展开时统计的子样本状态码（只有 777 算数，601 不算）
-    correctCodeMinCount: 4,        // 状态码 = judgeCode 的条数 > 3（即 ≥ 该值）→ 模式1；否则模式2
+    judgeCodes: ['777', '601'],    // 需要展开时统计的子样本状态码（两个码各自计数）
+    correctCodeMinCount: 4,        // 任一 judgeCode 的条数 > 3（即 ≥ 该值）→ 模式1；都不足 → 模式2
     noScoreStopCount: 3,           // 安全保护：连续多少行"匹配分读不到"就立即停止（0=关闭）
                                    //   防第5列选择器失效时把整批合集误判为全错
-    correctCodes: ['777', '601'],  // 9.1.0 起不再参与判定，仅用于日志/自检说明：这些码代表"前人已判定"
     wrongCode: '594',              // 判错完成标志（全选+批量错误后，子样本状态码 0 → 594）
     unjudgedCode: '0',             // 未判定
     // —— 慢处理（集数 > 阈值）——
@@ -415,20 +423,21 @@
     return Array.from(qsa(expandedRow, SELECTORS.childRow));
   }
 
-  // 汇总当前展开子表：状态码分布 + judgeCode(777) 条数 + 可读得分条数
-  // 9.2.0：90~95 档用"状态码 777 的条数"判定，故这里统计 judgeCount
+  // 汇总当前展开子表：状态码分布 + 各 judgeCode(777/601) 条数 + 可读得分条数
+  // 9.1.1：展开判定用"777 或 601 的条数（各自计数）"，故这里统计 judgeCounts
   function getCodeStats(expandedRow) {
     const rows = getChildRows(expandedRow);
     const counters = {};
     let unjudged = 0;
     let scoreKnown = 0;         // 能读到得分的条数（便于排查列错）
-    let judgeCount = 0;         // 9.2.0：状态码 = judgeCode(777) 的子样本条数（90~95 档判据）
+    const judgeCounts = {};     // 9.1.1：各 judgeCode 的子样本条数，如 {777: 5, 601: 0}
+    CONFIG.judgeCodes.forEach((c) => { judgeCounts[c] = 0; });
     rows.forEach((row) => {
       const code = getChildCode(row);
       counters[code] = (counters[code] || 0) + 1;
       // 空值也视为未判定（避免列结构异常时被误认为已完成）
       if (code === CONFIG.unjudgedCode || code === '') unjudged++;
-      if (code === CONFIG.judgeCode) judgeCount++;
+      if (CONFIG.judgeCodes.includes(code)) judgeCounts[code] = (judgeCounts[code] || 0) + 1;
 
       const sc = parseNum(cellText(row, SELECTORS.childScoreCell));
       if (sc !== null) scoreKnown++;
@@ -444,7 +453,7 @@
       notWrong: rows.length - wrongCount, // 还不是 594 的行数（含 0 与其它状态码）
       counters: counters,
       detail: detail,
-      judgeCount: judgeCount,            // 状态码 = judgeCode 的条数
+      judgeCounts: judgeCounts,          // 各 judgeCode 的条数
       scoreKnown: scoreKnown,
     };
   }
@@ -798,15 +807,15 @@
       needExpand = true;
       expandReason = (similar ? '两列相似' : '两列不相似') + ' 且 匹配分 ' + score +
         (similar ? ' ≤ ' : ' > ') + CONFIG.parentScoreThreshold +
-        ' → 展开合集统计状态码 ' + CONFIG.judgeCode + ' 的条数（> ' + (CONFIG.correctCodeMinCount - 1) +
-        ' 条 → 模式1；否则模式2）';
+        ' → 展开合集统计状态码 ' + CONFIG.judgeCodes.join('/') + ' 的条数（任一个 > ' +
+        (CONFIG.correctCodeMinCount - 1) + ' 条 → 模式1；都不足 → 模式2）';
     }
 
     if (!needExpand) {
       log('===== 判定模式' + mode + '：' + reason + ' =====');
       setStatus('模式' + mode + '：' + reason);
     } else {
-      log('===== 判定待定（展开统计状态码 ' + CONFIG.judgeCode + ' 条数）：' + expandReason + ' =====');
+      log('===== 判定待定（展开统计状态码 ' + CONFIG.judgeCodes.join('/') + ' 条数）：' + expandReason + ' =====');
       setStatus('待定：' + expandReason);
     }
 
@@ -829,22 +838,24 @@
     }
 
     const stats = getCodeStats(expandedRow);
+    // 9.1.1：各判定码的条数，如 "777 5 条 / 601 0 条"
+    const judgeText = CONFIG.judgeCodes.map((c) => c + ' ' + (stats.judgeCounts[c] || 0) + ' 条').join(' / ');
     log('子样本统计：共 ' + stats.total + ' 条 | 状态码 ' + stats.detail +
-      ' | 状态码' + CONFIG.judgeCode + ' ' + stats.judgeCount + ' 条' +
+      ' | ' + judgeText +
       ' | 已打594 ' + stats.wrong + ' 条(可读得分 ' + stats.scoreKnown + ' 条)');
 
-    // ---- ⑤ 待定 → 用状态码 judgeCode(777) 的条数判定（>3 条即 ≥4 → 模式1）----
+    // ---- ⑤ 待定 → 用状态码 judgeCodes(777/601) 的条数判定（任一个 > 3 条 → 模式1）----
     if (needExpand) {
-      const hit = stats.judgeCount >= CONFIG.correctCodeMinCount;
+      const hitCodes = CONFIG.judgeCodes.filter((c) => (stats.judgeCounts[c] || 0) >= CONFIG.correctCodeMinCount);
       const head = (similar ? '两列相似' : '两列不相似') + ' 且 匹配分 ' + score +
-        '（' + (similar ? '≤' : '>') + ' ' + CONFIG.parentScoreThreshold + '），展开后状态码 ' +
-        CONFIG.judgeCode + ' 共 ' + stats.judgeCount + ' 条';
-      if (hit) {
+        '（' + (similar ? '≤' : '>') + ' ' + CONFIG.parentScoreThreshold + '），展开后 ' + judgeText;
+      if (hitCodes.length > 0) {
         mode = 1;
-        reason = head + ' > ' + (CONFIG.correctCodeMinCount - 1) + ' → 判该合集正确';
+        reason = head + ' → 状态码 ' + hitCodes.join('/') + ' 各自超过 ' +
+          (CONFIG.correctCodeMinCount - 1) + ' 条 → 判该合集正确';
       } else {
         mode = 2;
-        reason = head + ' ≤ ' + (CONFIG.correctCodeMinCount - 1) + ' → 全错';
+        reason = head + ' → 没有任何判定码超过 ' + (CONFIG.correctCodeMinCount - 1) + ' 条 → 全错';
       }
       log('===== 补充判定模式' + mode + '：' + reason + ' =====');
       setStatus('模式' + mode + '：' + reason);
@@ -1127,10 +1138,10 @@
           ① 关键词双列比对：第3列命中且第4列也有同一词 → 继续判定；第4列没有 → <b>直接全错</b><br>
           ② 匹配分读不到 → <b>直接全错</b>（不数 777）<br>
           ③ <b>相似 且 匹配分 &gt; ${CONFIG.parentScoreThreshold}</b> → <b>模式1</b>：不展开，直接点「全剧审核」<br>
-          ④ <b>相似 且 匹配分 ≤ ${CONFIG.parentScoreThreshold}</b> → <b>展开合集</b>：状态码 ${CONFIG.judgeCode} 的条数 &gt; ${CONFIG.correctCodeMinCount - 1} → <b>模式1</b>；否则 <b>模式2</b><br>
-          ⑤ <b>不相似 且 匹配分 &gt; ${CONFIG.parentScoreThreshold}</b> → <b>展开合集</b>：状态码 ${CONFIG.judgeCode} 的条数 &gt; ${CONFIG.correctCodeMinCount - 1} → <b>模式1</b>；否则 <b>模式2</b><br>
+          ④ <b>相似 且 匹配分 ≤ ${CONFIG.parentScoreThreshold}</b> → <b>展开合集</b>：状态码 <b>${CONFIG.judgeCodes.join('/')}</b> 的条数，<b>任一个 &gt; ${CONFIG.correctCodeMinCount - 1}</b> → <b>模式1</b>；都不足 → <b>模式2</b><br>
+          ⑤ <b>不相似 且 匹配分 &gt; ${CONFIG.parentScoreThreshold}</b> → <b>展开合集</b>：同 ④ 判据（777 或 601 各自 &gt; ${CONFIG.correctCodeMinCount - 1} 条）<br>
           ⑥ <b>不相似 且 匹配分 ≤ ${CONFIG.parentScoreThreshold}</b> → <b>直接全错</b>（不数 777，仍走全选判错）<br>
-          相似判据：两列<b>连续 ${CONFIG.similarMinSubstr} 字相同</b>，或<b>公共不同字 ≥ ${CONFIG.similarMinCommonChars} 个</b>（状态码 ${CONFIG.judgeCode} 之外的码如 601 不参与计数）<br>
+          相似判据：两列<b>连续 ${CONFIG.similarMinSubstr} 字相同</b>，或<b>公共不同字 ≥ ${CONFIG.similarMinCommonChars} 个</b>（计数只看 ${CONFIG.judgeCodes.join(' / ')}，其余状态码不参与）<br>
           <b>模式2</b> = 展开 + 全选 + 批量错误（等全部 ${CONFIG.wrongCode}）+ 全剧审核<br>
           <b>安全保护</b>：连续 ${CONFIG.noScoreStopCount} 行匹配分读不到 → <b>自动停止运行</b>（防第5列选择器失效时整批被误判全错）<br>
           <b>等待/重试</b>：全剧审核是否完成<b>只看第2列合集id</b>（唯一）；等待期间第 ${CONFIG.retryAtSec.join('s / ')}s 各重试点击一次同一按钮（最多3次）；仍无响应 → <b>永久跳过该合集，换下一行继续</b><br>
@@ -1241,7 +1252,7 @@
       '①关键词仅第3列→全错 ②匹配分读不到→全错 ' +
       '③相似且匹配分>' + CONFIG.parentScoreThreshold + '→模式1（不展开直接全剧审核） ' +
       '④相似且≤' + CONFIG.parentScoreThreshold + ' ／ ⑤不相似且>' + CONFIG.parentScoreThreshold +
-      '→展开：状态码' + CONFIG.judgeCode + '条数>' + (CONFIG.correctCodeMinCount - 1) + '→模式1，否则模式2 ' +
+      '→展开：状态码' + CONFIG.judgeCodes.join('/') + ' 各自条数>' + (CONFIG.correctCodeMinCount - 1) + '→模式1，否则模式2 ' +
       '⑥不相似且≤' + CONFIG.parentScoreThreshold + '→直接全错');
     // 结构自检：打印第1~2行解析结果，便于发现页面改版
     setTimeout(debugStructure, 1500);
@@ -1268,7 +1279,7 @@
           '（' + sim.detail + '）');
       }
       console.log('[自检] 子样本状态码列 = ' + SELECTORS.childCodeCell + '（0=未判定, ' +
-        CONFIG.wrongCode + '=判错完成, ' + CONFIG.correctCodes.join('/') + '=前人已判定/有正确数据）');
+        CONFIG.wrongCode + '=判错完成, ' + CONFIG.judgeCodes.join('/') + '=前人已判定(参与计数)）');
     } catch (e) {
       console.warn('[自检] 页面结构解析异常:', e);
     }
