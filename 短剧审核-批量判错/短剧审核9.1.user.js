@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.1.5
+// @version      9.1.6
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；相似度×匹配分二维判定（所有文本都比对相似度）：相似且>95 → 直接全剧审核；相似且≤95 或 不相似且>95 → 展开按状态码 777 或 601 的条数（任一个>3）判定；不相似且≤95 / 匹配分读不到 → 直接全错；含终极关键词、关键词双列比对、30s/60s重试、永久跳过与严格等待加载
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -11,6 +11,16 @@
 // @connect      localhost
 // @run-at       document-end
 // ==/UserScript==
+
+// ============================== 9.1.6 修复：单字终极关键词误杀 ==============================
+//  【问题】终极关键词里有单字「画」，规则是"第3列命中 → 直接全错，不执行任何后续判定"。
+//          结果像「画币为诺，救恩父女是我的靠山」这种正常剧名（首字就是"画"）被直接判全错，
+//          哪怕：两列完全相同（相似）、匹配分 98 > 95、子样本得分>95 有 6 条 —— 本该"通过"也没机会。
+//  【修复】单字终极关键词改为"双列比对"：
+//          · 第3列命中该字、第4列也有同一个字  → 不再直接判错，继续正常判定
+//          · 第3列命中该字、第4列没有         → 仍然直接全错（保留拦截能力）
+//          · 多字终极关键词（红果/充电专属/动画/免费/剪辑/花絮/拍摄/论剑大会/动漫/定档/首播）行为不变
+// ==========================================================================
 
 // ============================== 9.1.5 新增：判定日志上报 ==============================
 //  【功能】每条合集判定都上报到本地后端，便于事后汇总/排查：
@@ -136,6 +146,7 @@
     // —— 关键词规则（8.0：双列比对）——
     nameKeywords: ['短剧', '画', '漫剧', 'AI', '充电', '红果', '专属', '动画', '免费', '剪辑', '花絮', '拍摄', '经典', '剧', '真人', '免', '动漫', '动', '&', '定档', '首播', '漫', 'ai', '果'],
     // —— 9.0 终极关键词（最高优先级）：第3列一旦命中 → 直接全错，不看后续任何判定 ——
+    //   9.1.6：多字关键词 → 命中即直接全错；单字关键词（如「画」）→ 需第4列也没有该字才全错
     ultimateKeywords: ['红果', '充电专属', '动画', '免费', '剪辑', '花絮', '拍摄', '论剑大会', '动漫', '定档', '首播', '画'],
     // —— 相似度：第3列短剧名 vs 第4列(疑似抄袭的原短剧名) ——
     //   9.1.0：所有文本都比对相似度（不再限制短剧名字数）
@@ -357,10 +368,20 @@
 
   // ========== 9.0 终极关键词（最高优先级） ==========
   // 第3列（短剧名）一旦命中 → 直接全错，不看第4列、不看匹配分、不看子样本
+  // 9.1.6：只返回"多字"（≥2 字）终极关键词 —— 命中即直接全错
   function getUltimateKeyword(name) {
     if (!name) return '';
     for (const kw of CONFIG.ultimateKeywords) {
-      if (kw && name.includes(kw)) return kw;
+      if (kw && kw.length >= 2 && name.includes(kw)) return kw;
+    }
+    return '';
+  }
+
+  // 9.1.6：单字终极关键词（如「画」）—— 太宽，改为"双列比对"：第4列也有该字就不直接判错
+  function getSingleCharUltimate(name) {
+    if (!name) return '';
+    for (const kw of CONFIG.ultimateKeywords) {
+      if (kw && kw.length === 1 && name.includes(kw)) return kw;
     }
     return '';
   }
@@ -976,13 +997,15 @@
     }
 
     // ---- 第1步：母行信息 + 终极关键词 + 关键词 + 相似度（不需要展开）----
-    const ultimateKw = getUltimateKeyword(meta.name);
+    const ultimateKw = getUltimateKeyword(meta.name);          // 多字：命中即全错
+    const singleUlt = getSingleCharUltimate(meta.name);        // 单字：还要看第4列（9.1.6）
     const kwr = getKeywordRule(R, meta);
     const sim = checkSimilarOriginalName(R, meta);
     const similar = sim.similar;   // 9.1.0：所有文本都比对相似度（不再限制短剧名字数）
 
     log('终极关键词检查：短剧名「' + meta.name + '」 → ' +
-      (ultimateKw ? ('命中「' + ultimateKw + '」→ 直接全错（跳过所有后续判定）') : '未命中'));
+      (ultimateKw ? ('命中「' + ultimateKw + '」→ 直接全错（跳过所有后续判定）')
+        : (singleUlt ? ('命中单字「' + singleUlt + '」→ 需看第4列是否也有该字（9.1.6）') : '未命中')));
     log('关键词比对：短剧名「' + meta.name + '」 vs 原短剧名「' + meta.originalName + '」 → ' +
       (kwr.kw ? ('命中「' + kwr.kw + '」，第4列' + (kwr.dual ? '也有该词 → 继续按匹配分判定' : '没有该词 → 直接全错'))
         : '第3列未命中关键词'));
@@ -992,7 +1015,8 @@
     // 9.1.5：初始化本轮判定上下文（供上报日志；展开后会补上子样本首条 id 与统计数字）
     state.lastJudge = {
       childId: '', childRowText: '', similar: similar, simDetail: sim.detail,
-      kw: kwr.kw || '', dual: !!kwr.dual, ultimate: ultimateKw || '',
+      kw: kwr.kw || '', dual: !!kwr.dual,
+      ultimate: ultimateKw || (singleUlt ? (singleUlt + '(单字,需双列)') : ''),
       matchMode: '', counts: null,
     };
 
@@ -1001,9 +1025,14 @@
     let needExpand = false, expandKind = '', expandReason = '';
 
     if (ultimateKw) {
-      // ⓪ 终极关键词：第3列命中 → 直接全错，不看相似度/匹配分
+      // ⓪ 多字终极关键词：第3列命中 → 直接全错，不看相似度/匹配分
       mode = 2;
       reason = '【终极关键词】「' + ultimateKw + '」出现在第3列 → 直接全错（不执行后续判定）';
+    } else if (singleUlt && !(meta.originalName || '').includes(singleUlt)) {
+      // ⓪-2 单字终极关键词（9.1.6）：只有"第4列也没有这个字"时才全错；
+      //      第4列也有 → 不直接判错，继续走相似度/匹配分/777 的正常判定
+      mode = 2;
+      reason = '单字终极关键词「' + singleUlt + '」只出现在第3列（第4列没有该字）→ 直接全错';
     } else if (kwr.hit) {
       // ① 第3列命中普通关键词、第4列没有 → 直接全错
       mode = 2;
@@ -1535,7 +1564,9 @@
       '仍无响应 → 永久跳过该合集换下一行（最多跳过 ' + CONFIG.maxSkipCount + ' 个）');
     log('安全保护：连续 ' + CONFIG.noScoreStopCount + ' 行匹配分读不到 → 立即停止运行' +
       (CONFIG.noScoreStopCount > 0 ? '' : '（当前已关闭）'));
-    log('终极关键词（第3列命中即直接全错）：' + CONFIG.ultimateKeywords.join('、'));
+    log('终极关键词：多字命中即全错，单字（' +
+      CONFIG.ultimateKeywords.filter((k) => k && k.length === 1).join('、') +
+      '）改为双列比对（第4列也有则不判错）｜当前表：' + CONFIG.ultimateKeywords.join('、'));
     log('低分保护：匹配分 < ' + CONFIG.lowScoreFloor + ' → 一律全错，不看状态码 ' +
       CONFIG.judgeCodes.join('/') + (CONFIG.lowScoreFloor > 0 ? '' : '（当前已关闭）'));
     log('判定（9.1.3：通过都必须展开核对）：⓪终极关键词→全错 ' +
