@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.2.0
+// @version      9.2.1
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（多字/单字终极关键词、普通关键词仅第3列、匹配分<低分下限）外一律展开核对：得分>95 的条数≥4 或 状态码 777/601 达标（子样本≤30条的小合集≥2、大合集≥4）→ 全剧审核；否则全选+批量错误后点「查询」刷新；含终极关键词、关键词双列比对、30s/60s重试、永久跳过、严格等待加载与慢处理档位
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -11,6 +11,27 @@
 // @connect      localhost
 // @run-at       document-end
 // ==/UserScript==
+
+// ============================== 9.2.1 匹配分读不到：不再中断整轮（重读 → 跳过 → 刷新后重试） ==============================
+//  【问题】9.1~9.2.0 的"相邻 3 行读不到匹配分 → 立即停止运行并弹窗"在实际使用中【经常误触发】：
+//          列表/母本还在刷新时第5列会短暂为空，脚本却判为"页面改版"直接停下；
+//          使用者往往"再点一次开始运行"就能继续（因为重启会清零连续计数），但过几条又停。
+//  【本质】9.1.7 之后"匹配分读不到"已不再导致"直接全错"（改为展开核对），
+//          所以这条"防整批误判"的保险已经没有必要用"中断整轮"来实现；
+//          而"读不到"的真实含义多半就是需求里说的"该母本还没刷新好"。
+//  【本次】把 noScoreStopCount（相邻N行读不到就停）改为三段式：
+//    ① 重读：先等加载完成，再重读 scoreRetryCount 次（间隔 scoreRetryGapMs，默认 3 次 × 1.2s），
+//           读到了就用新分数继续正常判定；
+//    ② 跳过：仍读不到 → 记入 notReadyIds（=「还没刷新好」），本轮先跳过该合集、继续审别的行，
+//           绝不判错、绝不中断整轮；点过「查询」刷新列表后自动清零并重试；
+//    ③ 汇总：同一合集跳过 scoreGiveUpRounds 次（默认 3）仍读不到 → 本轮彻底放弃它
+//           （进 giveUpIds，避免"跳过→结束确认→又扫到"来回打转），结束时在弹窗里列出
+//           这些合集（含 id/短剧名/行号/第5列原文/尝试次数）供人工处理。
+//  【安全网】本轮"还没刷新好"累计到 scoreSkipWarnCount（默认 5）时，面板日志提示
+//           检查 SELECTORS.parentScoreCell —— 只提示，不停止运行。
+//  【面板】「异常行上限（相邻N行读不到就停）」改为「匹配分重读：读不到重读N次(0=立即跳过)」。
+//  【不变】判定规则、模式1/模式2 流程、扫描与结束判定（9.2.0）、慢处理档位（9.1.9）。
+// ==========================================================================
 
 // ============================== 9.2.0 扫描与结束判定（已审核=边界 + 结束前刷新确认） ==============================
 //  【需求】"遇到已审核说明下面的数据都已经是审核过的了；看看是不是第一行，不是就说明可以往回审核试试；
@@ -24,8 +45,8 @@
 //    ④ 扫不到可审行时不再立刻收工：先点「查询」刷新列表确认（默认两次 endConfirmRounds=2），
 //       每次等加载完成 + endConfirmSettleMs(1.5s) 稳定后重扫；仍无可审行 → 判定审核结束。
 //    ⑤ "审完"的口径 = 页面除了【已审核】与【已跳过的异常数据】之外，没有未审核行。
-//  【不变】判定规则、模式1/模式2 流程、展开/判错/全剧审核/各类等待，
-//          以及"相邻多行读不到匹配分即停止"的既有保护。
+//  【不变】判定规则、模式1/模式2 流程、展开/判错/全剧审核/各类等待
+//          （"相邻多行读不到匹配分即停止运行"这条保护已在 9.2.1 改为"重读 → 跳过 → 刷新后重试"）。
 // ==========================================================================
 
 // ============================== 9.1.9 慢处理档位全量生效（补齐未接线的等待闸门） ==============================
@@ -174,8 +195,10 @@
     correctCodeMinCount: 4,        // 【大合集】任一 judgeCode 的条数 ≥ 该值 → 模式1（子样本 > smallCollectionMaxRows 条时用）
     correctCodeMinCountSmall: 2,   // 【小合集】子样本 ≤ smallCollectionMaxRows 条时，门槛降为 ≥ 该值
     smallCollectionMaxRows: 30,    // 小合集的判定边界：子样本条数 ≤ 该值 视为小合集（9.1.8）
-    noScoreStopCount: 3,           // 安全保护：连续多少行"匹配分读不到"就立即停止（0=关闭）
-                                   //   防第5列选择器失效时把整批合集误判为全错
+    scoreRetryCount: 3,            // 9.2.1：母本匹配分读不到时，先等加载完成并重读几次；仍读不到才算"还没刷新好"
+    scoreRetryGapMs: 1200,         // 9.2.1：匹配分重读的间隔(ms)
+    scoreSkipWarnCount: 5,         // 9.2.1：本轮"还没刷新好"累计到该条数时，提示检查第5列选择器（只提示，不停止运行）
+    scoreGiveUpRounds: 3,          // 9.2.1：同一合集最多尝试几次（每次都是"重读+跳过+等下次刷新"）；超过则本轮彻底放弃并汇总
     wrongCode: '594',              // 判错完成标志（全选+批量错误后，子样本状态码 0 → 594）
     unjudgedCode: '0',             // 未判定
     // —— 慢处理（集数 > 阈值）——
@@ -228,8 +251,10 @@
     processedCount: 0,
     mode1Count: 0,       // 直接全剧审核次数
     mode2Count: 0,       // 全选判错次数
-    noScoreStreak: 0,    // 连续多少行匹配分读不到（读取到就清零；达到 noScoreStopCount 即停止）
-    noScoreLastIdx: -1,  // 最近一次出现"匹配分读不到"的行号（用于判断是否真的相邻行）
+    notReadyIds: new Set(),  // 9.2.1：匹配分读不到 =「母本还没刷新好」的合集id（本轮先跳过，列表刷新后自动重试）
+    notReadyList: [],        // 9.2.1：明细 {id,name,row,raw,tries,time}，结束时汇总提示
+    notReadyTries: new Map(),// 9.2.1：id → 已跳过次数（超过 scoreGiveUpRounds 就本轮彻底放弃，防来回打转）
+    giveUpIds: new Set(),    // 9.2.1：本轮彻底放弃的合集id（匹配分始终读不到，需人工处理）
     doneIds: new Set(),  // 9.1.3：本轮已成功处理过的合集id（查询后可能仍留在列表里，避免重复处理）
     lastJudge: null,     // 9.1.5：本轮判定的上下文（子样本首条id/相似/关键词/统计），供上报日志用
     workIndex: 0,        // 当前工作行（0=第1行）
@@ -314,6 +339,39 @@
   // 无论快慢都按普通档走；这里统一取值，让「慢处理」真正全量生效。
   function loadWaitMax() {
     return state.curSlow ? CONFIG.loadingWaitMaxSlow : CONFIG.loadingWaitMax;
+  }
+
+  // ========== 9.2.1：母本匹配分（第5列）读取 ==========
+  // 读不到 ≠ 页面改版：多数情况是母本还没刷新好。这里先重读几次，仍读不到就交给上层
+  // 按「还没刷新好」处理（本轮先跳过该合集、继续审别的行，刷新列表后自动重试）。
+  function readParentScore(R) {
+    const el = R ? R.querySelector(SELECTORS.parentScoreCell) : null;
+    const raw = ((el && el.textContent) || '').replace(/\s+/g, ' ').trim();
+    return { score: parseNum(raw), raw: raw };
+  }
+
+  // 重读若干次；返回 { score, raw }，score 仍为 null 表示确实读不到
+  async function waitParentScore(R) {
+    let last = readParentScore(R);
+    if (last.score !== null) return last;
+
+    const tries = Math.max(0, CONFIG.scoreRetryCount | 0);
+    for (let i = 1; i <= tries; i++) {
+      if (!state.running) return last;
+      setStatus('等母本匹配分刷新（第 ' + i + '/' + tries + ' 次）...');
+      if (CONFIG.strictLoading && i === 1) await waitLoadingDone('等母本匹配分刷新', loadWaitMax());
+      await delay(CONFIG.scoreRetryGapMs);
+      if (!R || !R.isConnected) {
+        last = { score: null, raw: '(行已消失)' };
+        continue;
+      }
+      last = readParentScore(R);
+      if (last.score !== null) {
+        log('✓ 匹配分已刷新出来：' + last.score + '（重读第 ' + i + ' 次）');
+        return last;
+      }
+    }
+    return last;
   }
 
   // ========== 严格等待加载完成（antd 转圈闸门） ==========
@@ -897,6 +955,11 @@
     }
     log('点击「' + CONFIG.queryBtnText + '」刷新列表...');
     safeClick(btn);
+    // 9.2.1：列表刷新后，之前"还没刷新好"（匹配分读不到）的合集重新参与扫描
+    if (state.notReadyIds.size > 0) {
+      log('↻ 列表已刷新 → 重新尝试之前读不到匹配分的 ' + state.notReadyIds.size + ' 个合集');
+      state.notReadyIds = new Set();
+    }
     return true;
   }
 
@@ -957,7 +1020,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.1',
-      version: '9.2.0',
+      version: '9.2.1',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -1304,6 +1367,8 @@
         continue;
       }
       if (state.skipIds.has(meta.id)) continue;          // 异常数据（本轮已永久跳过）
+      if (state.notReadyIds.has(meta.id)) continue;      // 9.2.1：匹配分读不到=还没刷新好，本轮先跳过
+      if (state.giveUpIds.has(meta.id)) continue;        // 9.2.1：多次刷新仍读不到匹配分，本轮已放弃
       if (state.doneIds.has(meta.id)) continue;          // 本轮已处理过
       state.workIndex = i;
       return { R: R, meta: meta, idx: i, boundary: firstReviewedIdx, unreadableId: unreadableId };
@@ -1376,30 +1441,51 @@
 
         const R = target.R, meta = target.meta;
 
-        // ---- 9.1 安全保护：页面上相邻多行"匹配分读不到" → 疑似第5列选择器失效，立即停止 ----
-        // 目的：避免页面改版时把整批合集按"读不到→直接全错"误判掉
-        // 9.1.3：判定"连续"时要求行号真正相邻（中间夹着已审核/已跳过的行会打断），并打印第5列原文
-        if (CONFIG.noScoreStopCount > 0) {
-          if (meta.score === null) {
-            // 9.1.3：只有"页面上真正相邻的行"才累计连续次数（中间夹着已审核/已跳过的行会打断计数），
-            //         避免把分散在不同位置的空匹配分行误判成"连续读不到"而提前停止
-            state.noScoreStreak = (state.noScoreLastIdx === target.idx - 1) ? (state.noScoreStreak + 1) : 1;
-            state.noScoreLastIdx = target.idx;
-            const scoreCellEl = R.querySelector(SELECTORS.parentScoreCell);
-            const rawScore = ((scoreCellEl && scoreCellEl.textContent) || '').replace(/\s+/g, ' ').trim();
-            log('⚠️ 第' + (target.idx + 1) + '行匹配分读不到（相邻连续 ' + state.noScoreStreak + '/' +
-              CONFIG.noScoreStopCount + ' 行）｜第5列原文「' + (rawScore || '(空)') + '」｜id=' + meta.id +
-              '｜短剧名「' + meta.name + '」');
-            if (state.noScoreStreak >= CONFIG.noScoreStopCount) {
-              abortReason = '相邻 ' + state.noScoreStreak + ' 行读不到匹配分（第5列），疑似页面改版/选择器失效';
-              log('⛔ ' + abortReason + ' → 立即停止运行（本行未处理，请检查 SELECTORS.parentScoreCell）');
-              log('   ↳ 已处理 ' + state.processedCount + ' 个合集；如需继续可把面板「异常行上限」调大或设为 0 关闭该保护');
-              setStatus('⛔ ' + abortReason + '，已停止');
-              break;
-            }
+        // ---- 9.2.1：匹配分读不到 = "母本还没刷新好"，不再中断整轮运行 ----
+        // 旧做法（9.1~9.2.0）：相邻 3 行读不到匹配分 → 判为选择器失效，立即停止并弹窗；
+        //   实际使用中它经常在"列表还在刷新"时误触发（重新点开始又能继续），故改为：
+        //   ① 先等加载完成并重读 scoreRetryCount 次（间隔 scoreRetryGapMs）；
+        //   ② 读到了 → 用新分数继续正常判定；
+        //   ③ 仍读不到 → 记入 notReadyIds（=「还没刷新好」），本轮先跳过它、继续审别的行；
+        //      点过「查询」刷新列表后会自动重试；结束时在汇总弹窗里列出这些合集。
+        if (meta.score === null) {
+          const sc = await waitParentScore(R);
+          if (sc.score !== null) {
+            meta.score = sc.score;
           } else {
-            state.noScoreStreak = 0;
-            state.noScoreLastIdx = target.idx;
+            // 记「还没刷新好」：本轮跳过，刷新列表后再试；试满 scoreGiveUpRounds 次仍读不到 → 本轮彻底放弃该合集
+            // （否则"跳过→结束确认点查询→重新扫到→又跳过"会来回打转）
+            const tries = (state.notReadyTries.get(meta.id) || 0) + 1;
+            state.notReadyTries.set(meta.id, tries);
+            state.notReadyIds.add(meta.id);
+
+            const exist = state.notReadyList.find((x) => x.id === meta.id);
+            if (exist) {
+              exist.tries = tries;
+              exist.raw = sc.raw;
+              exist.time = new Date().toLocaleTimeString();
+            } else {
+              state.notReadyList.push({
+                id: meta.id, name: meta.name, row: target.idx + 1,
+                raw: sc.raw, tries: tries, time: new Date().toLocaleTimeString(),
+              });
+            }
+
+            if (tries > CONFIG.scoreGiveUpRounds) {
+              state.giveUpIds.add(meta.id);          // 本轮不再当候选（结束时会汇总提示）
+              log('⛔ 第' + (target.idx + 1) + '行「' + meta.name + '」匹配分多次刷新仍读不到（第5列原文「' +
+                (sc.raw || '(空)') + '」，已试 ' + tries + ' 次）→ 本轮放弃该合集，结束时汇总，可人工处理');
+            } else {
+              log('⏸ 第' + (target.idx + 1) + '行「' + meta.name + '」匹配分读不到（第5列原文「' +
+                (sc.raw || '(空)') + '」，第 ' + tries + '/' + CONFIG.scoreGiveUpRounds + ' 次）→ ' +
+                '视为母本还没刷新好：本轮先跳过它、继续审别的行（刷新列表后自动重试）');
+            }
+            if (state.notReadyList.length === CONFIG.scoreSkipWarnCount) {
+              log('⚠️ 本轮已有 ' + state.notReadyList.length + ' 个合集读不到匹配分。脚本不会因此停止；' +
+                '但如果整表都读不到，请检查 SELECTORS.parentScoreCell（第5列）是否失效');
+            }
+            updatePanel();
+            continue;                     // 不判错、不展开，继续扫下一行
           }
         }
 
@@ -1464,10 +1550,18 @@
            state.skipList.slice(0, 10).map((s) => ' · [' + s.id + '] ' + s.name + ' ← ' + s.reason).join('\n') +
            (state.skipList.length > 10 ? '\n …（其余见面板「复制跳过清单」）' : ''))
         : '\n（无跳过合集）';
+      const notReadyText = state.notReadyList.length > 0
+        ? ('\n\n⏸ 还没刷新好（匹配分读不到）' + state.notReadyList.length + ' 个，本轮未处理：\n' +
+           state.notReadyList.slice(0, 8).map((s) => ' · [' + s.id + '] ' + s.name +
+             '（第' + s.row + '行，第5列原文「' + (s.raw || '(空)') + '」，试了' + (s.tries || 1) + '次）').join('\n') +
+           (state.notReadyList.length > 8 ? '\n …（其余见面板日志）' : '') +
+           (state.giveUpIds.size > 0 ? ('\n其中 ' + state.giveUpIds.size + ' 个多次刷新仍读不到，本轮已放弃，需人工处理') : '') +
+           '\n可再点一次「开始运行」重试这些合集')
+        : '';
       setTimeout(() => alert('处理完成！共处理 ' + state.processedCount + ' 个合集\n模式1(直接全剧审核) ' +
         state.mode1Count + ' 个 / 模式2(全选判错) ' + state.mode2Count + ' 个' +
         '\n结束确认：已点「' + CONFIG.queryBtnText + '」刷新 ' + CONFIG.endConfirmRounds +
-        ' 次，未再发现未审核行' + skipText), 100);
+        ' 次，未再发现未审核行' + skipText + notReadyText), 100);
     }
   }
 
@@ -1543,9 +1637,9 @@
           <span>低于该分一律全错</span>
         </div>
         <div class="form-row">
-          <label>异常行上限：</label>
-          <input type="number" id="noscore-limit" value="${CONFIG.noScoreStopCount}" min="0" max="99">
-          <span>相邻N行读不到匹配分就停(0=关)</span>
+          <label>匹配分重读：</label>
+          <input type="number" id="noscore-limit" value="${CONFIG.scoreRetryCount}" min="0" max="9">
+          <span>读不到重读N次(0=立即跳过)</span>
         </div>
         <div class="form-row">
           <label>慢处理集数：</label>
@@ -1626,7 +1720,7 @@
       if (!isNaN(row) && row > 0) CONFIG.startRow = row;
       if (!isNaN(p)) CONFIG.parentScoreThreshold = p;
       if (!isNaN(lf)) CONFIG.lowScoreFloor = lf;
-      if (!isNaN(ns) && ns >= 0) CONFIG.noScoreStopCount = ns;
+      if (!isNaN(ns) && ns >= 0) CONFIG.scoreRetryCount = ns;
       if (!isNaN(s) && s > 0) CONFIG.slowEpisodeThreshold = s;
       if (strictEl) CONFIG.strictLoading = strictEl.checked;
       const rpEl = document.querySelector('#report-log');
@@ -1658,8 +1752,10 @@
     state.processedCount = 0;
     state.mode1Count = 0;
     state.mode2Count = 0;
-    state.noScoreStreak = 0;
-    state.noScoreLastIdx = -1;
+    state.notReadyIds = new Set();
+    state.notReadyList = [];
+    state.notReadyTries = new Map();
+    state.giveUpIds = new Set();
     state.doneIds = new Set();
     state.lastJudge = null;
     state.curSlow = false;      // 9.1.9：本轮开始前重置"慢处理"档位
@@ -1680,8 +1776,9 @@
       '确认弹窗就绪都按此分档）');
     log('等待重试：第 ' + CONFIG.retryAtSec.join('s、') + 's 各重试点击一次（每按钮最多3次）；' +
       '仍无响应 → 永久跳过该合集换下一行（最多跳过 ' + CONFIG.maxSkipCount + ' 个）');
-    log('安全保护：连续 ' + CONFIG.noScoreStopCount + ' 行匹配分读不到 → 立即停止运行' +
-      (CONFIG.noScoreStopCount > 0 ? '' : '（当前已关闭）'));
+    log('匹配分读不到（9.2.1）：先等加载完成并重读 ' + CONFIG.scoreRetryCount + ' 次（间隔 ' +
+      CONFIG.scoreRetryGapMs + 'ms）；仍读不到 → 视为"母本还没刷新好"，本轮跳过该合集、继续审别的行，' +
+      '刷新列表后自动重试并在结束时汇总（不再中断整轮运行）');
     log('扫描与结束（9.2.0）：每轮从第' + CONFIG.startRow + '行往下扫；「已审核」视为边界（下面都已审过）；' +
       '第2列 id 读不到的异常行跳过继续看；扫不到可审行时点「' + CONFIG.queryBtnText + '」刷新确认 ' +
       CONFIG.endConfirmRounds + ' 次，确认没有未审核行才判定审核结束');
