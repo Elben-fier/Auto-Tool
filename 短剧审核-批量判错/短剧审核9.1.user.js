@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.4.3
+// @version      9.4.4
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（关键词双列比对、母本最高分(第5列)<90）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含关键词双列比对（命中词第4列缺任一即全错）、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -55,6 +55,17 @@
 //      ⑨ 全剧审核/查询刷新的完成判定改为"按合集 id 是否还在列表里"（原来只看 workIndex 那一格，
 //         列表重排后那一格会换成别的合集 → 把这个合集误判成已完成而漏掉）；
 //      ⑩ 判定日志上报遇到非 2xx 也进冷却（原来只有网络错误才冷却，后端报 404/500 时会刷屏）。
+//  【9.4.4 修复（独立审查第二轮）】
+//      ⑪【重要】子样本"有效行为 0"（得分全是 0/读不到）时不再判全错 —— 原来会真的全选+批量错误打 594；
+//         现在与"母本最高分读不到"同一套：本轮跳过、刷新列表后自动重试；
+//      ⑫ 点击按钮改用 safeClick 的返回值（原来丢弃返回值 → 元素失效时"没点到"也被当成已提交）；
+//      ⑬ 确认弹窗只在【点击后新出现的】弹窗里找确定键（原来全文档找第一个"确定/确认/删除"，
+//         可能点到页面自带弹窗）；找不到新弹窗时才退回原来的宽松查找；
+//      ⑭ 按「停止」不再给被打断的合集写一条假的判定日志（reportJudge 移到停止判断之后）；
+//      ⑮ "跳过满上限"与"真的审完"在结束弹窗里区分开（原来都会显示"处理完成！"）；
+//      ⑯ 主循环同一合集连续异常 maxErrTriesPerRow(3) 次就永久跳过（唯一可能原地打转的地方）；
+//      ⑰ 母本行已从列表消失时立即停止重读（不再白跑剩下的重读轮次，首轮还压在 90s 闸门里）；
+//      ⑱ 上报的 counts 按 CONFIG.judgeCodes 动态生成（原来写死 judge777/judge601）。
 //  【版本号提醒】文件内部版本见上方 @version；历史文件「短剧审核9.0」也用过内部号 9.2.0，勿混淆。
 //  注意：9.4.2 那版的上报字段 version 漏改，日志里显示的是 9.4.1（9.4.3 起已跟随版本）。
 //  规则拆解：docs/短剧审核9.1判定机制详解.md ｜ 逐版本变更史：docs/版本演进记录.md
@@ -131,6 +142,7 @@
     startRow: 1,                   // 起始行号（1开始）
     afterProblemDelay: 2000,       // 跳过合集后等待再继续
     maxSkipCount: 20,              // 最多跳过多少个合集（安全上限，超过则停止提示人工）
+    maxErrTriesPerRow: 3,          // 9.4.4：同一合集连续抛异常多少次就永久跳过（防止原地重试不前进）
   };
 
   // ========== 运行状态 ==========
@@ -143,6 +155,7 @@
     notReadyList: [],        // 9.2.1：明细 {id,name,row,raw,tries,time}，结束时汇总提示
     notReadyTries: new Map(),// 9.2.1：id → 已跳过次数（超过 scoreGiveUpRounds 就本轮彻底放弃，防来回打转）
     giveUpIds: new Set(),    // 9.2.1：本轮彻底放弃的合集id（母本最高分始终读不到，需人工处理）
+    errTries: new Map(),     // 9.4.4：id → 主循环异常次数（超过 maxErrTriesPerRow 就永久跳过，防原地重试）
     doneIds: new Set(),  // 9.1.3：本轮已成功处理过的合集id（查询后可能仍留在列表里，避免重复处理）
     lastJudge: null,     // 9.1.5：本轮判定的上下文（子样本首条id/相似/关键词/统计），供上报日志用
     workIndex: 0,        // 当前工作行（0=第1行）
@@ -252,8 +265,9 @@
       if (CONFIG.strictLoading && i === 1) await waitLoadingDone('等母本最高分刷新', loadWaitMax());
       await delay(CONFIG.scoreRetryGapMs);
       if (!R || !R.isConnected) {
-        last = { score: null, raw: '(行已消失)' };
-        continue;
+        // 9.4.4：行都已经不在文档里了 → 立刻返回，不必把剩下的重读轮次（每轮还带 1.2s 等待）跑完
+        log('母本行已从列表消失 → 停止重读母本最高分');
+        return { score: null, raw: '(行已消失)' };
       }
       last = readParentScore(R);
       if (last.score !== null) {
@@ -310,37 +324,59 @@
   }
 
   // ==========【弹窗确定按钮】ant-popconfirm 优先（4.5/5.0 同款） ==========
-  async function waitForConfirmBtn(timeout) {
+  // 9.4.4：点击按钮前先拍一张"当前已有弹窗"的快照；找确定键时优先只看新出现的弹窗
+  function snapshotOverlays() {
+    return new Set(Array.from(document.querySelectorAll('.ant-popconfirm, .ant-modal-wrap, .ant-modal')));
+  }
+
+  function pickConfirmBtnIn(nodes, mode) {
+    for (const node of nodes) {
+      if (!node.isConnected) continue;
+      if (mode === 'popconfirm' && !node.classList.contains('ant-popconfirm')) continue;
+      const sel = mode === 'popconfirm' ? 'button' : 'button.ant-btn-primary';
+      const btns = node.querySelectorAll(sel);
+      for (const btn of btns) {
+        const txt = (btn.textContent || '').replace(/\s+/g, '');
+        if ((txt.includes('确定') || txt.includes('确认') || txt.includes('删除')) && !txt.includes('取消')) {
+          return btn;
+        }
+      }
+    }
+    return null;
+  }
+
+  // 只认"可见"的弹窗（display:none / opacity:0 视为不可见）
+  function visibleOverlays(selector, exclude) {
+    const out = [];
+    for (const el of document.querySelectorAll(selector)) {
+      if (!el.isConnected) continue;
+      if (exclude && exclude.has(el)) continue;            // 点击前就存在的 → 排除
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.opacity === '0') continue;
+      out.push(el);
+    }
+    return out;
+  }
+
+  async function waitForConfirmBtn(timeout, knownOverlays) {
     const startTime = Date.now();
     while (Date.now() - startTime < timeout) {
-      // 策略1: .ant-popconfirm
-      const popconfirms = document.querySelectorAll('.ant-popconfirm');
-      for (const pc of popconfirms) {
-        if (!pc.isConnected) continue;
-        const style = window.getComputedStyle(pc);
-        if (style.display === 'none' || style.opacity === '0') continue;
-        const btns = pc.querySelectorAll('button');
-        for (const btn of btns) {
-          const txt = (btn.textContent || '').replace(/\s+/g, '');
-          if ((txt.includes('确定') || txt.includes('确认') || txt.includes('删除')) && !txt.includes('取消')) {
-            return btn;
-          }
-        }
-      }
-      // 策略2: .ant-modal 内 primary
-      const modals = document.querySelectorAll('.ant-modal-wrap, .ant-modal');
-      for (const modal of modals) {
-        if (!modal.isConnected) continue;
-        const style = window.getComputedStyle(modal);
-        if (style.display === 'none') continue;
-        const btns = modal.querySelectorAll('button.ant-btn-primary');
-        for (const btn of btns) {
-          const txt = (btn.textContent || '').replace(/\s+/g, '');
-          if ((txt.includes('确定') || txt.includes('确认') || txt.includes('删除')) && !txt.includes('取消')) {
-            return btn;
-          }
-        }
-      }
+      // 第1轮：优先只在【点击后新出现】的弹窗里找（最不容易误点）
+      const freshPc = visibleOverlays('.ant-popconfirm', knownOverlays);
+      let btn = pickConfirmBtnIn(freshPc, 'popconfirm');
+      if (btn) return btn;
+      const freshModal = visibleOverlays('.ant-modal-wrap, .ant-modal', knownOverlays);
+      btn = pickConfirmBtnIn(freshModal, 'modal');
+      if (btn) return btn;
+
+      // 第2轮：没有新弹窗时，退回原来的宽松查找（保证兼容：有些页面弹窗是复用的旧节点）
+      const anyPc = visibleOverlays('.ant-popconfirm', null);
+      btn = pickConfirmBtnIn(anyPc, 'popconfirm');
+      if (btn) return btn;
+      const anyModal = visibleOverlays('.ant-modal-wrap, .ant-modal', null);
+      btn = pickConfirmBtnIn(anyModal, 'modal');
+      if (btn) return btn;
+
       await delay(200);
     }
     console.warn('[弹窗定位] 超时，未找到确定按钮');
@@ -349,8 +385,8 @@
 
   // 确认弹窗增强点击（7.0：点确定前也要求页面无转圈）
   // 9.1.9：等待弹窗就绪的档位也按"慢处理"分档（原来慢合集也只有硬编码的 20s）
-  async function clickConfirm(timeout) {
-    const confirmBtn = await waitForConfirmBtn(timeout);
+  async function clickConfirm(timeout, knownOverlays) {
+    const confirmBtn = await waitForConfirmBtn(timeout, knownOverlays);
     if (!confirmBtn) return false;
     if (CONFIG.strictLoading) {
       await waitLoadingDone('确认弹窗就绪',
@@ -778,10 +814,16 @@
     }
 
     console.log('[按钮] 点击「' + btnText + '」');
-    safeClick(btn);
+    // 9.4.4：记录点击前已经存在的弹窗 —— 点完后只在"新冒出来的"弹窗里找确定键，
+    //   避免页面上残留的别的弹窗（例如页面自带的删除确认）被误点
+    const knownOverlays = snapshotOverlays();
+    if (!safeClick(btn)) {
+      console.warn('[按钮] 「' + btnText + '」点击失败（元素已失效）');
+      return false;
+    }
     await delay(800);
 
-    if (await clickConfirm(CONFIG.modalWaitMax)) return true;
+    if (await clickConfirm(CONFIG.modalWaitMax, knownOverlays)) return true;
     console.warn('[按钮] 「' + btnText + '」确认弹窗未出现');
     return false;
   }
@@ -993,7 +1035,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.1',
-      version: '9.4.3',
+      version: '9.4.4',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -1015,15 +1057,20 @@
         ? ('预演(未点击) · 本应' + (res.mode === 1 ? '通过(全剧审核)' : '全错(批量错误)'))
         : (res.result === 'ok'
             ? (res.mode === 1 ? '通过(全剧审核)' : '全错(批量错误)')
-            : '异常/跳过'),
+            : (res.result === 'notready' ? '还没刷新好(未处理)' : '异常/跳过')),
       reason: res.reason || '',
-      counts: {
-        total: counts.total || 0,
-        wrong594: counts.wrong || 0,
-        scoreHigh: counts.scoreHigh || 0,
-        judge777: judge['777'] || 0,
-        judge601: judge['601'] || 0,
-      },
+      counts: (function () {
+        // 9.4.4：按 CONFIG.judgeCodes 动态生成（原来写死 judge777/judge601，
+        //   一旦改 judgeCodes，这两项就恒为 0，后端统计会失真）
+        const out = {
+          total: counts.total || 0,
+          wrong594: counts.wrong || 0,
+          scoreHigh: counts.scoreHigh || 0,
+        };
+        CONFIG.judgeCodes.forEach((c) => { out['judge' + c] = judge[c] || 0; });
+        out.judgeCounts = Object.assign({}, judge);
+        return out;
+      })(),
     };
   }
 
@@ -1202,6 +1249,15 @@
 
     const stats = getCodeStats(expandedRow);
     warnIfChildPaginated(expandedRow);          // 9.4.3：子表分页预警（只提示，不改流程）
+
+    // ---- 9.4.4：有效行为 0（子样本得分全是 0/读不到）→ 绝不能据此判全错 ----
+    // 这种合集等于"一条可用数据都没有"，判全错会真的全选 + 批量错误打 594（破坏性误判）。
+    // 与"母本最高分读不到"同一套处理：本轮跳过、刷新列表后重试。
+    if (needExpand && stats.valid === 0) {
+      log('⏸ 该合集子样本得分全部为 0/读不到（有效行 0 / 共 ' + stats.total +
+        ' 条）→ 视为还没刷新好：本轮跳过，不判错、不点击');
+      return { result: 'notready', mode: 0, reason: '子样本得分全部未刷新（有效行 0）' };
+    }
 
     // 9.1.5：子样本第一条 id（子样本第2列）+ 第一条整行文本 + 统计数字 → 供上报
     if (state.lastJudge) {
@@ -1444,10 +1500,12 @@
 
   async function runLoop() {
     let done = false;
-    let abortReason = '';       // 9.1 保护：非正常停止的原因（连续读不到母本最高分）
+    let stopKind = '';          // 9.4.4：finished=真的审完 / skipLimit=跳过满上限提前结束
+    let abortReason = '';       // 9.1 保护：非正常停止的原因（id 全读不到）
     while (state.running) {
+      let target = null;        // 9.4.4：提到 try 外，catch 里才能知道是哪一行出的异常
       try {
-        let target = pickTarget();
+        target = pickTarget();
         if (target.done) {
           if (target.abort) {                       // 整段 id 都读不到 → 页面改版，仍按"立即停止"处理
             abortReason = target.why;
@@ -1458,7 +1516,14 @@
           log(target.why);
           // 9.2.0：结束前先点「查询」刷新确认（默认两次）；刷新后若又出现未审核行 → 继续审
           target = await confirmReviewFinished(target.why);
-          if (!target) { done = true; break; }
+          if (!target) {
+            // 9.4.4：这里的 null 有两种含义 —— ①真的审完了 ②用户点了停止/被中断。
+            //   必须区分，否则"点了停止"也会弹"处理完成！"
+            if (!state.running) break;
+            done = true;
+            stopKind = 'finished';
+            break;
+          }
         }
 
         const R = target.R, meta = target.meta;
@@ -1516,8 +1581,30 @@
           (meta.isSlow ? '（慢处理）' : '') + ' =====');
 
         const res = await processOneCollection(R, meta);
-        reportJudge(meta, res, state.lastJudge);   // 9.1.5：上报判定日志（后端没开也不影响审核）
+        // 9.4.4：先判断是否已被「停止」打断 —— 否则会把这条被打断的合集当成"判定结果"写进日志
         if (!state.running) break;
+        reportJudge(meta, res, state.lastJudge);   // 9.1.5：上报判定日志（后端没开也不影响审核）
+
+        // ---- 9.4.4：判定途中发现"数据还没刷新好"（子样本得分全是 0/读不到）----
+        // 与"母本最高分读不到"同一套处理：本轮跳过、刷新列表后自动重试，绝不判错
+        if (res.result === 'notready') {
+          const tries = (state.notReadyTries.get(meta.id) || 0) + 1;
+          state.notReadyTries.set(meta.id, tries);
+          state.notReadyIds.add(meta.id);
+          if (tries > CONFIG.scoreGiveUpRounds) state.giveUpIds.add(meta.id);
+          const entry = {
+            id: meta.id, name: meta.name, row: target.idx + 1,
+            raw: res.reason || '子样本得分全部未刷新', tries: tries,
+            time: new Date().toLocaleTimeString(),
+          };
+          const exist = state.notReadyList.find((x) => x.id === meta.id);
+          if (exist) Object.assign(exist, entry); else state.notReadyList.push(entry);
+          log('⏸ 第' + (target.idx + 1) + '行「' + meta.name + '」' + (res.reason || '子样本得分全部未刷新') +
+            '（第 ' + tries + '/' + CONFIG.scoreGiveUpRounds + ' 次）→ 本轮跳过，刷新列表后自动重试');
+          updatePanel();
+          await collapseRow(R);            // 为读统计展开过 → 收起来，别把子表行留在 DOM
+          continue;
+        }
 
         if (res.result === 'ok') {
           state.doneIds.add(meta.id);          // 9.1.3：防止同一合集在列表未刷新时被重复处理
@@ -1549,12 +1636,30 @@
         if (state.skipIds.size >= CONFIG.maxSkipCount) {
           log('累计跳过已达上限 ' + CONFIG.maxSkipCount + ' 个，停止运行，请人工处理');
           done = true;
+          stopKind = 'skipLimit';        // 9.4.4：这是"提前结束"，不能显示成"处理完成"
           break;
         }
         // 从下一行开始找目标（永久跳过当前合集）
         state.workIndex = target.idx + 1;
       } catch (e) {
         console.error('[短剧9.1] 主循环异常:', e);
+        // 9.4.4：同一个合集反复抛异常时必须有上限 —— 否则会每 3 秒原地重试、永不推进
+        //   （这是"扫描→处理→结束确认→再扫描"这条链上唯一可能不终止的地方）
+        const errId = (target && target.meta) ? target.meta.id : '';
+        if (errId) {
+          const n = (state.errTries.get(errId) || 0) + 1;
+          state.errTries.set(errId, n);
+          if (n >= CONFIG.maxErrTriesPerRow) {
+            state.skipIds.add(errId);
+            state.skipList.push({
+              id: errId, name: target.meta.name,
+              reason: '连续异常 ' + n + ' 次：' + (e.message || e),
+              time: new Date().toLocaleTimeString(),
+            });
+            log('⛔ 合集[' + errId + '] 连续异常 ' + n + ' 次 → 本轮永久跳过，换下一行');
+            updatePanel();
+          }
+        }
         log('主循环异常: ' + (e.message || e) + '，3秒后继续');
         await delay(3000);
       }
@@ -1573,7 +1678,8 @@
            (state.skipList.length > 10 ? '\n …（其余见面板「复制跳过清单」）' : ''))
         : '\n（无跳过合集）';
       const notReadyText = state.notReadyList.length > 0
-        ? ('\n\n⏸ 还没刷新好（母本最高分读不到）' + state.notReadyList.length + ' 个，本轮未处理：\n' +
+        ? ('\n\n⏸ 还没刷新好（母本最高分读不到 / 子样本得分全为 0）' + state.notReadyList.length +
+           ' 个，本轮未处理：\n' +
            state.notReadyList.slice(0, 8).map((s) => ' · [' + s.id + '] ' + s.name +
              '（第' + s.row + '行，第5列原文「' + (s.raw || '(空)') + '」，试了' + (s.tries || 1) + '次）').join('\n') +
            (state.notReadyList.length > 8 ? '\n …（其余见面板日志）' : '') +
@@ -1581,7 +1687,11 @@
            '\n可再点一次「开始运行」重试这些合集')
         : '';
       const dr = !!CONFIG.dryRun;
-      const drTitle = dr ? '🧪 预演结束（未执行任何点击）\n' : '';
+      const drTitle = dr ? '🧪 预演结束（未执行任何点击）\n'
+        : (stopKind === 'skipLimit'
+            ? ('⚠️ 已跳过 ' + state.skipIds.size + ' 个合集（达上限 ' + CONFIG.maxSkipCount +
+               '）——本轮【提前结束】，不是全部审完\n')
+            : '');
       const modeLine = '模式1(' + (dr ? '本应全剧审核' : '直接全剧审核') + ') ' + state.mode1Count +
         ' 个 / 模式2(' + (dr ? '本应全选判错' : '全选判错') + ') ' + state.mode2Count + ' 个';
       const endLine = dr
@@ -1620,7 +1730,7 @@
     }
     if (state.notReadyList && state.notReadyList.length > 0) {
       lines.push('');
-      lines.push('# 还没刷新好（母本最高分读不到）  共 ' + state.notReadyList.length + ' 个');
+      lines.push('# 还没刷新好（母本最高分读不到 / 子样本得分全为 0）  共 ' + state.notReadyList.length + ' 个');
       lines.push('# 合集id\t短剧名\t第5列原文\t尝试次数\t时间');
       state.notReadyList.forEach((s) => lines.push(
         [s.id, s.name, s.raw || '(空)', s.tries || 1, s.time].join('\t')));
@@ -1803,6 +1913,7 @@
     state.notReadyTries = new Map();
     state.giveUpIds = new Set();
     parentFilterWarned = false;   // 9.4.3：每轮重置"母本行过滤异常"提示
+    state.errTries = new Map();    // 9.4.4：重置异常计数
     state.doneIds = new Set();
     state.lastJudge = null;
     state.curSlow = false;      // 9.1.9：本轮开始前重置"慢处理"档位
