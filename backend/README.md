@@ -86,6 +86,14 @@ python server.py      # 或双击 run.bat（会自动安装依赖）
 - **查看**：浏览器打开 <http://127.0.0.1:5002/judge_log/view>（筛模式/结果/关键字，导出 CSV，清空日志）；
 - 脚本侧开关：面板勾选「上报判定日志」（`CONFIG.reportEnabled`）；后端未启动时脚本会自动冷却 60 秒并静默丢弃，**不影响审核流程**。
 
+> ⚠️ **注意：必须是已注册日志蓝图的后端**。如果 `/judge_log/view` 返回 **404**，说明你运行的是旧副本（没有 `judge_log.py` / 没注册蓝图的 `server.py`）。
+> 此时需要把 `backend/judge_log.py` 复制过去，并在那份 `server.py` 里加上：
+> ```python
+> from judge_log import judge_log_bp
+> app.register_blueprint(judge_log_bp)
+> ```
+> 然后**重启后端**（蓝图只在启动时注册，改完不重启仍然 404）。日志文件按各自目录分开存：`<该 server.py 所在目录>/logs/judge_log.jsonl`。
+
 常用命令：
 
 ```bash
