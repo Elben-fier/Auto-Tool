@@ -1,5 +1,6 @@
 # ===== 运行产物 =====
 *.log
+backend/logs/
 __pycache__/
 *.pyc
 .venv/

@@ -34,6 +34,7 @@
 │  本地 Python 后端（backend/，Flask）                                                 │
 │  ├─ /detect_batch_detail  YOLOv8n(person/tv/laptop/cell phone) + YuNet 人脸           │
 │  ├─ /compare              SSIM + dHash + 颜色直方图 + 宽高比                          │
+│  ├─ /judge_log            判定日志(上报→JSONL→网页查看/CSV)                           │
 │  ├─ /detect, /detect_batch, /health, /debug_screenshot                               │
 │  └─ TaskQueue：单线程串行 + 按图片张数限速（4.5 张/秒，超限 429）                      │
 └──────────────────────────────────────────────────────────────────────────────────────┘
@@ -95,6 +96,7 @@ python server.py          # 或双击 run.bat
 - 详细步骤与调参：**[docs/部署与使用指南.md](docs/部署与使用指南.md)**
 - 接口与算法：**[docs/后端接口与算法说明.md](docs/后端接口与算法说明.md)**
 - 版本演进与判定规则：**[docs/版本演进记录.md](docs/版本演进记录.md)**
+- 判定日志（短剧审核脚本自动上报）：启动后端后打开 **<http://127.0.0.1:5002/judge_log/view>**（可筛选、导出 CSV；存储于 `backend/logs/judge_log.jsonl`）
 
 ---
 

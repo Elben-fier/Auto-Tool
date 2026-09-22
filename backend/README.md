@@ -1,6 +1,6 @@
-# 本地后端 — 人像检测 / 图片相似度服务
+# 本地后端 — 人像检测 / 图片相似度 / 判定日志服务
 
-审核脚本依赖的本地 HTTP 服务，全部在本机完成推理（`http://127.0.0.1:5002`），**不上传任何图片或文本数据**。
+审核脚本依赖的本地 HTTP 服务，全部在本机完成推理与记录（`http://127.0.0.1:5002`），**不上传任何图片或文本数据**。
 
 ## 1. 运行环境与依赖
 
@@ -51,6 +51,7 @@ python server.py      # 或双击 run.bat（会自动安装依赖）
 [detector] YOLOv8n.onnx 加载成功（YOLO 模式）
   监听地址: http://127.0.0.1:5002
   速率限制: 4.5 张/秒（按图片张数计数，非按请求）
+  判定日志: POST /judge_log   查看 http://127.0.0.1:5002/judge_log/view
 ```
 
 健康检查：浏览器访问 <http://127.0.0.1:5002/health> 返回 `{"status":"ok"}`。
@@ -66,10 +67,34 @@ python server.py      # 或双击 run.bat（会自动安装依赖）
 | `/detect_batch_detail` | POST | 批量**明细**检测（人物/人脸/手机/屏幕 + 置信度，阈值可由前端传入） |
 | `/compare` | POST | 两两图片相似度（第5列 vs 第6列） |
 | `/debug_screenshot` | POST | 调试：按坐标截屏存盘 |
+| `/judge_log` | POST | **判定日志上报**（短剧审核脚本每条判定 POST 一次） |
+| `/judge_log` | GET | 查询判定日志（`limit/offset/mode/outcome/q`） |
+| `/judge_log/stats` | GET | 判定日志统计（按结果/模式/匹配分/原因） |
+| `/judge_log/export` | GET | 判定日志导出 CSV（带 BOM，Excel 直接打开） |
+| `/judge_log/view` | GET | 判定日志网页表格（5 秒自动刷新、可筛选、可清空） |
+| `/judge_log/clear` | POST | 清空判定日志 |
 
 字段与算法细节见 [../docs/后端接口与算法说明.md](../docs/后端接口与算法说明.md)。
 
-## 5. 可调阈值（`detector.py` 顶部）
+## 5. 判定日志（短剧审核脚本上报）
+
+短剧审核脚本（`短剧审核9.1.user.js` 等）会把**每条合集判定**上报到 `/judge_log`：
+
+- **记录的 id 是「子样本第一条 id」（子样本第 2 列）**，母本合集 id 只作参考一并保留；
+- 同时记录：短剧名 / 原短剧名 / 匹配分 / 是否相似 / 相似明细 / 命中关键词 / 终极关键词 / 判定模式(1通过·2全错) / 结果 / **判定原因（完整中文）** / 777·601 条数 / 高分(>95) 条数 / 已打 594 / 子样本总数；
+- 存储：`backend/logs/judge_log.jsonl`（追加写，一行一条，UTF-8；已在 `.gitignore` 中排除）；
+- **查看**：浏览器打开 <http://127.0.0.1:5002/judge_log/view>（筛模式/结果/关键字，导出 CSV，清空日志）；
+- 脚本侧开关：面板勾选「上报判定日志」（`CONFIG.reportEnabled`）；后端未启动时脚本会自动冷却 60 秒并静默丢弃，**不影响审核流程**。
+
+常用命令：
+
+```bash
+curl "http://127.0.0.1:5002/judge_log?limit=20"
+curl "http://127.0.0.1:5002/judge_log/stats"
+curl -o judge_log.csv "http://127.0.0.1:5002/judge_log/export"
+```
+
+## 6. 可调阈值（`detector.py` 顶部）
 
 | 常量 | 默认值 | 说明 |
 |---|---|---|

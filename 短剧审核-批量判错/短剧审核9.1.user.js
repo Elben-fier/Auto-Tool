@@ -1,13 +1,27 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.1.4
-// @description  相似度×匹配分二维判定（所有文本都比对相似度）：相似且>95 → 直接全剧审核；相似且≤95 或 不相似且>95 → 展开按状态码 777 或 601 的条数（任一个>3）判定；不相似且≤95 / 匹配分读不到 → 直接全错；含终极关键词、关键词双列比对、30s/60s重试、永久跳过与严格等待加载
+// @version      9.1.5
+// @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；相似度×匹配分二维判定（所有文本都比对相似度）：相似且>95 → 直接全剧审核；相似且≤95 或 不相似且>95 → 展开按状态码 777 或 601 的条数（任一个>3）判定；不相似且≤95 / 匹配分读不到 → 直接全错；含终极关键词、关键词双列比对、30s/60s重试、永久跳过与严格等待加载
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
 // @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// @connect      localhost
 // @run-at       document-end
 // ==/UserScript==
+
+// ============================== 9.1.5 新增：判定日志上报 ==============================
+//  【功能】每条合集判定都上报到本地后端，便于事后汇总/排查：
+//        POST http://127.0.0.1:5002/judge_log   {"entries":[{...}]}
+//        · 记录的 id 用【子样本第一条的 id】（子样本第2列），母本合集 id 仅作参考一并保留
+//        · 一并记录：短剧名 / 原短剧名 / 匹配分 / 是否相似 / 相似明细 / 命中关键词 / 终极关键词 /
+//                    判定模式(1/2) / 结果 / 判定原因(完整中文) / 777·601条数 / 高分(>95)条数 / 已打594 / 子样本总数
+//        · 查看：浏览器打开 http://127.0.0.1:5002/judge_log/view （5秒自动刷新、可筛选、可导出CSV）
+//  【安全】后端没开时只提示一次并冷却 60s，之后静默丢弃，完全不影响审核流程
+//  【开关】面板勾选「上报判定日志」；CONFIG.reportEnabled / backendBase
+// ==========================================================================
 
 // ============================== 9.1.4 补充 ==============================
 //  【本次】按需求移除面板底部的"判定说明"整块文本（.tip），面板更紧凑；
@@ -127,6 +141,11 @@
     //   9.1.0：所有文本都比对相似度（不再限制短剧名字数）
     similarMinSubstr: 2,           // 存在连续 N 个字相同（如"渐染"）即算相似
     similarMinCommonChars: 3,      // 或 两段文本公共的不同字 ≥ N 个
+    // —— 判定日志上报（9.1.5：POST 到本地后端 /judge_log）——
+    reportEnabled: true,                     // 是否上报判定日志（面板可开关）
+    backendBase: 'http://127.0.0.1:5002',    // 后端地址（接口为 /judge_log）
+    reportTimeoutMs: 8000,                   // 单次上报超时(ms)
+    reportRetryCooldownMs: 60000,            // 上报失败后的冷却(ms)，避免后端没开时刷屏
     // —— 运行 ——
     startRow: 1,                   // 起始行号（1开始）
     afterProblemDelay: 2000,       // 跳过合集后等待再继续
@@ -142,6 +161,7 @@
     noScoreStreak: 0,    // 连续多少行匹配分读不到（读取到就清零；达到 noScoreStopCount 即停止）
     noScoreLastIdx: -1,  // 最近一次出现"匹配分读不到"的行号（用于判断是否真的相邻行）
     doneIds: new Set(),  // 9.1.3：本轮已成功处理过的合集id（查询后可能仍留在列表里，避免重复处理）
+    lastJudge: null,     // 9.1.5：本轮判定的上下文（子样本首条id/相似/关键词/统计），供上报日志用
     workIndex: 0,        // 当前工作行（0=第1行）
     skipIds: new Set(),  // 已永久跳过的合集id（本轮不再处理）
     skipList: [],        // 跳过明细：{id,name,reason,time}
@@ -164,6 +184,7 @@
     childCheckbox: 'td:first-child input.ant-checkbox-input',
     childCodeCell: 'td:nth-child(3)',    // 子样本状态码：0=未判定 594=判错完成 777/601=前人已判定(有正确数据)
     childScoreCell: 'td:nth-child(8)',   // 子样本得分（8.0 新增：≥90 的好样本条数用于判定）
+    childIdCell: 'td:nth-child(2)',      // 9.1.5：子样本第一条的 id（上报判定日志用；按要求不用母本id）
   };
 
   // ========== 工具函数 ==========
@@ -454,6 +475,21 @@
 
   function getChildRows(expandedRow) {
     return Array.from(qsa(expandedRow, SELECTORS.childRow));
+  }
+
+  // 9.1.5：子样本“第一条”的 id（子样本第2列）—— 判定日志用的就是这个 id（不用母本 id）
+  function getFirstChildId(expandedRow) {
+    const rows = getChildRows(expandedRow);
+    if (!rows.length) return '';
+    return cellText(rows[0], SELECTORS.childIdCell);
+  }
+
+  // 9.1.5：子样本第一条的整行文本（截断），便于核对"id 是不是取对列了"
+  function getFirstChildRowText(expandedRow) {
+    const rows = getChildRows(expandedRow);
+    if (!rows.length) return '';
+    const txt = (rows[0].textContent || '').replace(/\s+/g, ' ').trim();
+    return txt.length > 160 ? txt.slice(0, 160) + '…' : txt;
   }
 
   // 汇总当前展开子表：状态码分布 + 各 judgeCode(777/601) 条数 + 可读得分条数
@@ -813,6 +849,109 @@
     return 'ok';
   }
 
+  // ========== 判定日志上报（9.1.5） ==========
+  // 把每条合集判定 POST 到本地后端 /judge_log；后端没开时只提示一次并冷却，绝不影响审核
+  const reportQueue = [];
+  let reporting = false;
+  let reportCooldownUntil = 0;
+  let reportWarned = false;
+  let reportOkLogged = false;
+
+  function buildJudgeEntry(meta, res, ctx) {
+    const c = ctx || {};
+    const counts = c.counts || {};
+    const judge = counts.judge || {};
+    return {
+      time: new Date().toLocaleString(),
+      ts: Date.now(),
+      script: '短剧审核9.1',
+      version: '9.1.5',
+      childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
+      childRowText: c.childRowText || '',
+      parentId: meta.id,                        // 母本合集 id（仅作参考）
+      name: meta.name,
+      originalName: meta.originalName,
+      score: meta.score,
+      episodes: meta.episodes,
+      isSlow: !!meta.isSlow,
+      similar: !!c.similar,
+      simDetail: c.simDetail || '',
+      keyword: c.kw || '',
+      keywordDual: !!c.dual,
+      ultimate: c.ultimate || '',
+      matchMode: c.matchMode || '',             // 展开核对类型：high / codes / 空
+      mode: res.mode || 0,
+      result: res.result || '',
+      outcome: res.result === 'ok'
+        ? (res.mode === 1 ? '通过(全剧审核)' : '全错(批量错误)')
+        : '异常/跳过',
+      reason: res.reason || '',
+      counts: {
+        total: counts.total || 0,
+        wrong594: counts.wrong || 0,
+        scoreHigh: counts.scoreHigh || 0,
+        judge777: judge['777'] || 0,
+        judge601: judge['601'] || 0,
+      },
+    };
+  }
+
+  function reportJudge(meta, res, ctx) {
+    if (!CONFIG.reportEnabled) return;
+    try {
+      reportQueue.push(buildJudgeEntry(meta, res, ctx));
+      while (reportQueue.length > 300) reportQueue.shift();   // 后端长期不可用时避免内存膨胀
+      flushReports();
+    } catch (e) {
+      console.warn('[短剧9.1] 组装判定日志失败:', e);
+    }
+  }
+
+  function flushReports() {
+    if (reporting || reportQueue.length === 0) return;
+    if (Date.now() < reportCooldownUntil) return;             // 冷却期内不再尝试
+    if (typeof GM_xmlhttpRequest !== 'function') {
+      if (!reportWarned) { reportWarned = true; log('⚠️ 缺少 GM_xmlhttpRequest 权限 → 判定日志未上报'); }
+      reportQueue.length = 0;
+      return;
+    }
+    const batch = reportQueue.splice(0, 50);
+    reporting = true;
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: CONFIG.backendBase + '/judge_log',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      data: JSON.stringify({ entries: batch }),
+      timeout: CONFIG.reportTimeoutMs,
+      onload: (r) => {
+        reporting = false;
+        if (r.status >= 200 && r.status < 300) {
+          reportCooldownUntil = 0;
+          if (!reportOkLogged) {
+            reportOkLogged = true;
+            log('✅ 判定日志已上报后端（查看：' + CONFIG.backendBase + '/judge_log/view）');
+          }
+        } else {
+          log('⚠️ 判定日志上报失败（HTTP ' + r.status + '），丢弃 ' + batch.length + ' 条');
+        }
+        if (reportQueue.length) setTimeout(flushReports, 300);
+      },
+      onerror: () => {
+        reporting = false;
+        reportCooldownUntil = Date.now() + CONFIG.reportRetryCooldownMs;
+        if (!reportWarned) {
+          reportWarned = true;
+          log('⚠️ 判定日志上报失败（后端未启动？' + CONFIG.backendBase + '）→ 暂停上报 ' +
+            Math.round(CONFIG.reportRetryCooldownMs / 1000) + 's，不影响审核');
+        }
+      },
+      ontimeout: () => {
+        reporting = false;
+        reportCooldownUntil = Date.now() + CONFIG.reportRetryCooldownMs;
+      },
+    });
+  }
+
   // ========== 处理单个合集（9.1.3 判定：相似度 × 匹配分 + 低分保护 + 展开核对） ==========
   // 模式1（通过）：一律"展开核对后"才可能通过（点「全剧审核」；不勾选、不判错）
   // 模式2（全错）：展开 + 全选 + 批量错误（等全部594）→ 点「查询」刷新列表（不再点全剧审核）
@@ -849,6 +988,13 @@
         : '第3列未命中关键词'));
     log('相似度比对（所有文本都算）：短剧名「' + meta.name + '」 vs 原短剧名「' + meta.originalName + '」(' +
       sim.nameLen + '字) → ' + (similar ? '相似' : '不相似') + '（' + sim.detail + '）');
+
+    // 9.1.5：初始化本轮判定上下文（供上报日志；展开后会补上子样本首条 id 与统计数字）
+    state.lastJudge = {
+      childId: '', childRowText: '', similar: similar, simDetail: sim.detail,
+      kw: kwr.kw || '', dual: !!kwr.dual, ultimate: ultimateKw || '',
+      matchMode: '', counts: null,
+    };
 
     const score = meta.score;
     let mode = 0, reason = '';
@@ -914,6 +1060,20 @@
     }
 
     const stats = getCodeStats(expandedRow);
+
+    // 9.1.5：子样本第一条 id（子样本第2列）+ 第一条整行文本 + 统计数字 → 供上报
+    if (state.lastJudge) {
+      state.lastJudge.childId = getFirstChildId(expandedRow);
+      state.lastJudge.childRowText = getFirstChildRowText(expandedRow);
+      state.lastJudge.matchMode = expandKind || '';
+      state.lastJudge.counts = {
+        total: stats.total,
+        wrong: stats.wrong,
+        scoreHigh: stats.scoreHigh,
+        judge: Object.assign({}, stats.judgeCounts),
+      };
+    }
+
     // 9.1.1：各判定码的条数，如 "777 5 条 / 601 0 条"；9.1.3：再加"得分 > 95 的条数"
     const judgeText = CONFIG.judgeCodes.map((c) => c + ' ' + (stats.judgeCounts[c] || 0) + ' 条').join(' / ');
     log('子样本统计：共 ' + stats.total + ' 条 | 状态码 ' + stats.detail +
@@ -1105,6 +1265,7 @@
           (meta.isSlow ? '（慢处理）' : '') + ' =====');
 
         const res = await processOneCollection(R, meta);
+        reportJudge(meta, res, state.lastJudge);   // 9.1.5：上报判定日志（后端没开也不影响审核）
         if (!state.running) break;
 
         if (res.result === 'ok') {
@@ -1250,6 +1411,10 @@
           <label class="p9-check"><input type="checkbox" id="strict-loading" ${CONFIG.strictLoading ? 'checked' : ''}> <b>严格等待加载完成</b></label>
           <span>转圈消失才点下一步</span>
         </div>
+        <div class="form-row">
+          <label class="p9-check"><input type="checkbox" id="report-log" ${CONFIG.reportEnabled ? 'checked' : ''}> <b>上报判定日志</b></label>
+          <span>POST /judge_log</span>
+        </div>
         <div class="stat-row">当前行：第 <b id="s9-row">1</b> 行 &nbsp;|&nbsp; 已完成：<b id="s9-count">0</b> 个 &nbsp;|&nbsp; 已跳过：<b id="s9-skip">0</b> 个</div>
         <div class="stat-row">模式1(直接全剧)：<b id="s9-m1">0</b> &nbsp;|&nbsp; 模式2(全选判错)：<b id="s9-m2">0</b></div>
         <div class="btn-row">
@@ -1319,6 +1484,8 @@
       if (!isNaN(ns) && ns >= 0) CONFIG.noScoreStopCount = ns;
       if (!isNaN(s) && s > 0) CONFIG.slowEpisodeThreshold = s;
       if (strictEl) CONFIG.strictLoading = strictEl.checked;
+      const rpEl = document.querySelector('#report-log');
+      if (rpEl) CONFIG.reportEnabled = rpEl.checked;
       startRun();
     });
     document.querySelector('#stop-btn').addEventListener('click', stopRun);
@@ -1349,6 +1516,10 @@
     state.noScoreStreak = 0;
     state.noScoreLastIdx = -1;
     state.doneIds = new Set();
+    state.lastJudge = null;
+    reportCooldownUntil = 0;
+    reportWarned = false;
+    reportOkLogged = false;
     state.skipIds = new Set();
     state.skipList = [];
     state.workIndex = CONFIG.startRow - 1;
@@ -1377,6 +1548,10 @@
       '⑦不相似且≤' + CONFIG.parentScoreThreshold + '→直接全错');
     log('模式2 收尾：批量错误(594)完成后点击「' + CONFIG.queryBtnText + '」刷新列表，不再点「全剧审核」');
     log('（面板已不再显示判定说明，完整规则见本段日志与源码注释）');
+    log('判定日志上报：' + (CONFIG.reportEnabled
+      ? ('开 → ' + CONFIG.backendBase + '/judge_log（记录 id 用【子样本第一条】(第2列)；查看 ' +
+         CONFIG.backendBase + '/judge_log/view）')
+      : '关'));
     // 结构自检：打印第1~2行解析结果，便于发现页面改版
     setTimeout(debugStructure, 1500);
     runLoop();

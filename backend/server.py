@@ -13,8 +13,10 @@ from flask import Flask, request, jsonify, make_response
 
 from task_queue import TaskQueue
 from detector import FaceDetector, image_similarity
+from judge_log import judge_log_bp
 
 app = Flask(__name__)
+app.register_blueprint(judge_log_bp)
 
 @app.after_request
 def add_cors_headers(resp):
@@ -358,5 +360,6 @@ if __name__ == "__main__":
     print("  监听地址: http://127.0.0.1:5002")
     print("  速率限制: 4.5 张/秒（按图片张数计数，非按请求）")
     print("  检测模型: YOLOv8n(person) + YuNet(人脸兜底)  [离线]")
+    print("  判定日志: POST /judge_log   查看 http://127.0.0.1:5002/judge_log/view")
     print("=" * 60)
     app.run(host="127.0.0.1", port=5002, threaded=False)
