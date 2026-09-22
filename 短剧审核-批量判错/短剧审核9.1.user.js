@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.1.7
+// @version      9.1.8
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；相似度×匹配分二维判定（所有文本都比对相似度）：相似且>95 → 直接全剧审核；相似且≤95 或 不相似且>95 → 展开按状态码 777 或 601 的条数（任一个>3）判定；不相似且≤95 / 匹配分读不到 → 直接全错；含终极关键词、关键词双列比对、30s/60s重试、永久跳过与严格等待加载
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -11,6 +11,14 @@
 // @connect      localhost
 // @run-at       document-end
 // ==/UserScript==
+
+// ============================== 9.1.8 601/777 门槛按合集大小分档 ==============================
+//  【需求】"存在两个 601 或 777 也是对的" —— 但门槛不能一概而论，要看母本展开的数据量：
+//        · 子样本条数 ≤ 30 条（小合集）→ 状态码 777 / 601 各自 ≥ 2 条即算"有前人数据"
+//        · 子样本条数 >  30 条（大合集）→ 仍要求各自 ≥ 4 条
+//  【配置】smallCollectionMaxRows(30) / correctCodeMinCountSmall(2) / correctCodeMinCount(4)
+//  【不变】高分判据仍为"得分 > 95 的条数 ≥ highScoreMinCount(4)"；低分下限(90)仍是硬规则
+// ==========================================================================
 
 // ============================== 9.1.7 进一步降低"误判全错" ==============================
 //  【背景】最怕的是"该对的被判全错"。原规则里有两条特别容易误杀：
@@ -129,7 +137,9 @@
     queryBtnText: '查询',          // 全错处理后的收尾：点击页面「查询」按钮刷新列表（不再点全剧审核）
     lowScoreFloor: 90,             // 【低分保护】匹配分 < 该值 → 一律全错（不看 777/601，不可能通过）；0=关闭
     judgeCodes: ['777', '601'],    // 需要展开时统计的子样本状态码（两个码各自计数）
-    correctCodeMinCount: 4,        // 任一 judgeCode 的条数 > 3（即 ≥ 该值）→ 模式1；都不足 → 模式2
+    correctCodeMinCount: 4,        // 【大合集】任一 judgeCode 的条数 ≥ 该值 → 模式1（子样本 > smallCollectionMaxRows 条时用）
+    correctCodeMinCountSmall: 2,   // 【小合集】子样本 ≤ smallCollectionMaxRows 条时，门槛降为 ≥ 该值
+    smallCollectionMaxRows: 30,    // 小合集的判定边界：子样本条数 ≤ 该值 视为小合集（9.1.8）
     noScoreStopCount: 3,           // 安全保护：连续多少行"匹配分读不到"就立即停止（0=关闭）
                                    //   防第5列选择器失效时把整批合集误判为全错
     wrongCode: '594',              // 判错完成标志（全选+批量错误后，子样本状态码 0 → 594）
@@ -1067,7 +1077,8 @@
       expandReason = '相似=' + (similar ? '是' : '否') + '、匹配分=' + (score === null ? '读不到' : score) +
         ' → 展开核对：得分 > ' + CONFIG.highScoreThreshold + ' 的条数 ≥ ' + CONFIG.highScoreMinCount +
         ' 条，或状态码 ' + CONFIG.judgeCodes.join('/') + ' 各自 ≥ ' + CONFIG.correctCodeMinCount +
-        ' 条 → 模式1；都不满足 → 模式2';
+        ' 条（子样本 ≤ ' + CONFIG.smallCollectionMaxRows + ' 条的小合集只要 ≥ ' +
+        CONFIG.correctCodeMinCountSmall + ' 条）→ 模式1；都不满足 → 模式2';
     }
 
     if (!needExpand) {
@@ -1114,24 +1125,26 @@
     if (needExpand) {
       // 9.1.7：展开核对统一判据（所有分支同一套）
       //   ① 高分数据够多：得分 > highScoreThreshold 的条数 ≥ highScoreMinCount
-      //   ② 或 前辈已判定：777 / 601 各自 ≥ correctCodeMinCount
-      const hitCodes = CONFIG.judgeCodes.filter((c) => (stats.judgeCounts[c] || 0) >= CONFIG.correctCodeMinCount);
+      //   ② 或 前人已判定：777 / 601 各自 ≥ 门槛（9.1.8：小合集 ≥2，大合集 ≥4）
+      const smallColl = stats.total > 0 && stats.total <= CONFIG.smallCollectionMaxRows;
+      const codeNeed = smallColl ? CONFIG.correctCodeMinCountSmall : CONFIG.correctCodeMinCount;
+      const hitCodes = CONFIG.judgeCodes.filter((c) => (stats.judgeCounts[c] || 0) >= codeNeed);
       const highHit = stats.scoreHigh >= CONFIG.highScoreMinCount;
       const head = (similar ? '两列相似' : '两列不相似') + '、匹配分 ' +
         (score === null ? '读不到' : score) + '（' + expandKind + '），展开后：' +
         judgeText + ' / 得分>' + CONFIG.highScoreThreshold + ' ' + stats.scoreHigh + ' 条' +
-        ' / 共 ' + stats.total + ' 条';
+        ' / 共 ' + stats.total + ' 条' + (smallColl ? ('（小合集，码门槛 ' + codeNeed + '）') : '');
       const hit = highHit || hitCodes.length > 0;
       if (hit) {
         mode = 1;
         reason = head + ' → ' + (highHit
           ? ('得分>' + CONFIG.highScoreThreshold + ' 的条数 ' + stats.scoreHigh + ' ≥ ' + CONFIG.highScoreMinCount)
-          : ('状态码 ' + hitCodes.join('/') + ' 各自 ≥ ' + CONFIG.correctCodeMinCount + ' 条')) +
+          : ('状态码 ' + hitCodes.join('/') + ' 各自 ≥ ' + codeNeed + ' 条')) +
           ' → 判该合集正确';
       } else {
         mode = 2;
         reason = head + ' → 得分>' + CONFIG.highScoreThreshold + ' 不足 ' + CONFIG.highScoreMinCount +
-          ' 条，且没有判定码 ≥ ' + CONFIG.correctCodeMinCount + ' 条 → 全错';
+          ' 条，且没有判定码 ≥ ' + codeNeed + ' 条 → 全错';
       }
       log('===== 补充判定模式' + mode + '：' + reason + ' =====');
       setStatus('模式' + mode + '：' + reason);
@@ -1574,8 +1587,9 @@
       '⓪多字终极关键词→全错 ⓪-2单字终极关键词(第4列也没有)→全错 ①关键词仅第3列→全错 ' +
       '②匹配分<' + CONFIG.lowScoreFloor + '→全错（唯一硬规则，不看子样本） ' +
       '③其余一律展开核对：得分>' + CONFIG.highScoreThreshold + ' 的条数≥' + CONFIG.highScoreMinCount +
-      ' 或 ' + CONFIG.judgeCodes.join('/') + ' 各自≥' + CONFIG.correctCodeMinCount + '→模式1，都不满足→模式2；' +
-      '相似度与匹配分只写日志、不再决定通过与否');
+      ' 或 ' + CONFIG.judgeCodes.join('/') + ' 各自≥' + CONFIG.correctCodeMinCount +
+      '（子样本≤' + CONFIG.smallCollectionMaxRows + ' 条的小合集：≥' + CONFIG.correctCodeMinCountSmall +
+      '）→模式1，都不满足→模式2；相似度与匹配分只写日志、不再决定通过与否');
     log('模式2 收尾：批量错误(594)完成后点击「' + CONFIG.queryBtnText + '」刷新列表，不再点「全剧审核」');
     log('（面板已不再显示判定说明，完整规则见本段日志与源码注释）');
     log('判定日志上报：' + (CONFIG.reportEnabled
