@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.3.0
-// @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（多字/单字终极关键词、普通关键词仅第3列、匹配分<低分下限）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含终极关键词、关键词双列比对、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
+// @version      9.4.0
+// @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（关键词双列比对、匹配分<低分下限）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含关键词双列比对（命中词第4列缺任一即全错）、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
 // @grant        GM_setClipboard
@@ -14,8 +14,9 @@
 
 // ============================== 当前机制摘要（完整变更史见 docs/版本演进记录.md） ==============================
 //  【判定链】硬规则（命中即模式2全错，不看子样本）：
-//      ⓪ 多字终极关键词命中第3列 ⓪-2 单字终极关键词「画」(且第4列也没有该字)
-//      ① 普通关键词仅出现在第3列 ② 匹配分 < lowScoreFloor(默认90)
+//      ① 关键词双列比对：第3列命中的关键词，只要有任一个在第4列没有 → 全错
+//         （9.4.0 起取消"终极关键词"，全部关键词都走这条；两列都有则放行继续判定）
+//      ② 匹配分 < lowScoreFloor(默认90)
 //    其余一切情况（相似/不相似、匹配分高低/读不到）→【展开核对】：
 //      · 子样本得分 = 0 或读不到的行走 =「还没刷新出来」→ 整行不计入任何统计（9.3.0）
 //      · 低分(<80)条数 > 正确数据条数 → 模式2 全错（9.3.0 新增，优先于"高分够多"）
@@ -89,11 +90,11 @@
     confirmReadyWaitMaxSlow: 40000,// 9.1.9：慢合集的"弹窗就绪"等待（放宽；原来硬编码 20s，慢合集也只有一个档）
     batchBtnWaitMax: 5000,         // 按钮从禁用变可用最长等待
     checkInterval: 500,            // 轮询间隔
-    // —— 关键词规则（8.0：双列比对）——
-    nameKeywords: ['短剧', '画', '漫剧', 'AI', '充电', '红果', '专属', '动画', '免费', '剪辑', '花絮', '拍摄', '经典', '剧', '真人', '免', '动漫', '动', '&', '定档', '首播', '漫', 'ai', '果'],
-    // —— 9.0 终极关键词（最高优先级）：第3列一旦命中 → 直接全错，不看后续任何判定 ——
-    //   9.1.6：多字关键词 → 命中即直接全错；单字关键词（如「画」）→ 需第4列也没有该字才全错
-    ultimateKeywords: ['红果', '充电专属', '动画', '免费', '剪辑', '花絮', '拍摄', '论剑大会', '动漫', '定档', '首播', '画'],
+    // —— 关键词（9.4.0：取消"终极关键词"，全部走双列比对；第3列命中的任一个词在第4列没有 → 全错）——
+    nameKeywords: ['短剧', '画', '漫剧', 'AI', '充电', '红果', '专属', '动画', '免费', '剪辑', '花絮', '拍摄', '经典', '剧', '真人', '免', '动漫', '动', '&', '定档', '首播', '漫', 'ai', '果', '论剑大会'],
+    // —— 9.4.0：原「终极关键词」表已取消 ——
+    //   原先 12 个终极词里 11 个本就在 nameKeywords 中（「充电专属」由「充电」「专属」覆盖），
+    //   唯一不在表里的「论剑大会」已补进 nameKeywords；现在所有关键词一律走双列比对。
     // —— 相似度：第3列短剧名 vs 第4列(疑似抄袭的原短剧名) ——
     //   9.1.0：所有文本都比对相似度（不再限制短剧名字数）
     similarMinSubstr: 2,           // 存在连续 N 个字相同（如"渐染"）即算相似
@@ -359,44 +360,34 @@
     };
   }
 
-  // ========== 9.0 终极关键词（最高优先级） ==========
-  // 第3列（短剧名）一旦命中 → 直接全错，不看第4列、不看匹配分、不看子样本
-  // 9.1.6：只返回"多字"（≥2 字）终极关键词 —— 命中即直接全错
-  function getUltimateKeyword(name) {
-    if (!name) return '';
-    for (const kw of CONFIG.ultimateKeywords) {
-      if (kw && kw.length >= 2 && name.includes(kw)) return kw;
-    }
-    return '';
-  }
-
-  // 9.1.6：单字终极关键词（如「画」）—— 太宽，改为"双列比对"：第4列也有该字就不直接判错
-  function getSingleCharUltimate(name) {
-    if (!name) return '';
-    for (const kw of CONFIG.ultimateKeywords) {
-      if (kw && kw.length === 1 && name.includes(kw)) return kw;
-    }
-    return '';
-  }
-
-  // ========== 关键词规则（8.0：双列比对） ==========
-  // 第3列（短剧名）命中关键词后，再看第4列（疑似抄袭原短剧名）是否也含【同一个词】：
-  //   两边都有 → 疑似正确（hit=false, dual=true），继续后面的判定
-  //   第4列没有 → 直接全错（hit=true）
-  // 第3列没命中 → hit=false, dual=false（不能作为"疑似正确"依据，交给后面的规则）
-  // 返回 { hit, dual, kw }
+  // ========== 关键词规则（8.0 双列比对；9.4.0：取消终极关键词，改"任一命中词缺失即全错"） ==========
+  // 把第3列（短剧名）命中的**全部**关键词都拿去和第4列（疑似抄袭原短剧名）比对：
+  //   · 命中的词第4列**全都有** → 疑似正确（hit=false, dual=true），继续后面的判定
+  //   · 只要有**任一个**命中词第4列没有 → 直接全错（hit=true，missing 列出缺的那些词）
+  //   · 第3列一个词都没命中 → hit=false, dual=false（不作为"疑似正确"依据，交给后面的规则）
+  // 返回 { hit, dual, kw, matched, missing }
+  //   kw      = 上报/日志用的一行文本（命中词；hit 时只列缺失的词）
+  //   matched = 第3列命中的全部关键词
+  //   missing = 其中第4列没有的词
   function getKeywordRule(parentRow, meta) {
     const name = meta ? meta.name : cellText(parentRow, SELECTORS.parentNameCell);
     const orig = meta ? meta.originalName : cellText(parentRow, SELECTORS.parentOriginalNameCell);
-    if (!name) return { hit: false, dual: false, kw: '' };
+    const empty = { hit: false, dual: false, kw: '', matched: [], missing: [] };
+    if (!name) return empty;
+
+    const matched = [];
+    const missing = [];
     for (const kw of CONFIG.nameKeywords) {
       if (!kw) continue;
-      if (name.includes(kw)) {
-        const dual = !!(orig && orig.includes(kw));
-        return { hit: !dual, dual: dual, kw: kw };
-      }
+      if (!name.includes(kw)) continue;
+      matched.push(kw);
+      if (!(orig && orig.includes(kw))) missing.push(kw);
     }
-    return { hit: false, dual: false, kw: '' };
+    if (matched.length === 0) return empty;
+    if (missing.length === 0) {
+      return { hit: false, dual: true, kw: matched.join('/'), matched: matched, missing: [] };
+    }
+    return { hit: true, dual: false, kw: missing.join('/'), matched: matched, missing: missing };
   }
 
   // ========== 相似度比对：第3列短剧名 vs 第4列(疑似抄袭的原短剧名) ==========
@@ -900,7 +891,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.1',
-      version: '9.3.0',
+      version: '9.4.0',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -1003,8 +994,7 @@
   // 模式1（通过）：一律"展开核对后"才可能通过（点「全剧审核」；不勾选、不判错）
   // 模式2（全错）：展开 + 全选 + 批量错误（等全部594）→ 点「查询」刷新列表（不再点全剧审核）
   // 判定优先级（9.1.3）：
-  //   ⓪ 多字终极关键词命中第3列                    → 模式2（不执行后续判定）
-  //   ⓪-2 单字终极关键词（第4列也没有）              → 模式2
+  //   ① 关键词：第3列命中的任一个词在第4列没有          → 模式2（9.4.0：取消终极关键词，全部走双列比对）
   //   ① 关键词双列比对：第3列命中且第4列无同词      → 模式2
   //   ② 匹配分 < 低分下限(lowScoreFloor)             → 模式2（唯一保留的硬规则：不看子样本）
   //   ③ 其余一切情况（相似/不相似、匹配分高/低/读不到）→ 展开核对（9.1.7 统一判据）：
@@ -1025,19 +1015,18 @@
       return { result: 'problem', mode: 0, reason: '上一轮加载未完成' };
     }
 
-    // ---- 第1步：母行信息 + 终极关键词 + 关键词 + 相似度（不需要展开）----
-    const ultimateKw = getUltimateKeyword(meta.name);          // 多字：命中即全错
-    const singleUlt = getSingleCharUltimate(meta.name);        // 单字：还要看第4列（9.1.6）
+    // ---- 第1步：母行信息 + 关键词 + 相似度（不需要展开）----
     const kwr = getKeywordRule(R, meta);
     const sim = checkSimilarOriginalName(R, meta);
     const similar = sim.similar;   // 9.1.0：所有文本都比对相似度（不再限制短剧名字数）
 
-    log('终极关键词检查：短剧名「' + meta.name + '」 → ' +
-      (ultimateKw ? ('命中「' + ultimateKw + '」→ 直接全错（跳过所有后续判定）')
-        : (singleUlt ? ('命中单字「' + singleUlt + '」→ 需看第4列是否也有该字（9.1.6）') : '未命中')));
-    log('关键词比对：短剧名「' + meta.name + '」 vs 原短剧名「' + meta.originalName + '」 → ' +
-      (kwr.kw ? ('命中「' + kwr.kw + '」，第4列' + (kwr.dual ? '也有该词 → 继续按匹配分判定' : '没有该词 → 直接全错'))
-        : '第3列未命中关键词'));
+    log('关键词比对（9.4.0：第3列命中的词必须第4列全都有，缺一个就全错）：短剧名「' + meta.name +
+      '」 vs 原短剧名「' + meta.originalName + '」 → ' +
+      (kwr.matched.length === 0
+        ? '第3列未命中关键词'
+        : ('命中「' + kwr.matched.join('、') + '」' +
+           (kwr.hit ? ('，其中第4列没有「' + kwr.missing.join('、') + '」→ 直接全错')
+                    : '，且第4列都有 → 继续后续判定'))));
     log('相似度比对（所有文本都算）：短剧名「' + meta.name + '」 vs 原短剧名「' + meta.originalName + '」(' +
       sim.nameLen + '字) → ' + (similar ? '相似' : '不相似') + '（' + sim.detail + '）');
 
@@ -1045,7 +1034,7 @@
     state.lastJudge = {
       childId: '', childRowText: '', similar: similar, simDetail: sim.detail,
       kw: kwr.kw || '', dual: !!kwr.dual,
-      ultimate: ultimateKw || (singleUlt ? (singleUlt + '(单字,需双列)') : ''),
+      ultimate: '',            // 9.4.0：终极关键词已取消，字段保留兼容旧日志
       matchMode: '', counts: null,
     };
 
@@ -1053,18 +1042,11 @@
     let mode = 0, reason = '';
     let needExpand = false, expandKind = '', expandReason = '';
 
-    if (ultimateKw) {
-      // ⓪ 多字终极关键词：第3列命中 → 直接全错，不看子样本
+    if (kwr.hit) {
+      // ① 关键词（9.4.0：第3列命中的词里，有任一个第4列没有）→ 直接全错
       mode = 2;
-      reason = '【终极关键词】「' + ultimateKw + '」出现在第3列 → 直接全错（不执行后续判定）';
-    } else if (singleUlt && !(meta.originalName || '').includes(singleUlt)) {
-      // ⓪-2 单字终极关键词（9.1.6）：只有"第4列也没有这个字"时才全错
-      mode = 2;
-      reason = '单字终极关键词「' + singleUlt + '」只出现在第3列（第4列没有该字）→ 直接全错';
-    } else if (kwr.hit) {
-      // ① 第3列命中普通关键词、第4列没有 → 直接全错
-      mode = 2;
-      reason = '关键词「' + kwr.kw + '」仅出现在第3列（第4列无该词）→ 直接全错';
+      reason = '关键词「' + kwr.missing.join('、') + '」出现在第3列但第4列没有（命中：' +
+        kwr.matched.join('、') + '）→ 直接全错';
     } else if (score !== null && CONFIG.lowScoreFloor > 0 && score < CONFIG.lowScoreFloor) {
       // ② 低分保护（9.1.7：唯一保留的"不看子样本"硬规则）
       mode = 2;
@@ -1713,13 +1695,12 @@
     log('扫描与结束（9.2.0）：每轮从第' + CONFIG.startRow + '行往下扫；「已审核」视为边界（下面都已审过）；' +
       '第2列 id 读不到的异常行跳过继续看；扫不到可审行时点「' + CONFIG.queryBtnText + '」刷新确认 ' +
       CONFIG.endConfirmRounds + ' 次，确认没有未审核行才判定审核结束');
-    log('终极关键词：多字命中即全错，单字（' +
-      CONFIG.ultimateKeywords.filter((k) => k && k.length === 1).join('、') +
-      '）改为双列比对（第4列也有则不判错）｜当前表：' + CONFIG.ultimateKeywords.join('、'));
+    log('关键词（9.4.0：已取消终极关键词，全部双列比对；第3列命中的词第4列缺任一个 → 全错）｜当前表：' +
+      CONFIG.nameKeywords.join('、'));
     log('低分保护：匹配分 < ' + CONFIG.lowScoreFloor + ' → 一律全错，不看状态码 ' +
       CONFIG.judgeCodes.join('/') + (CONFIG.lowScoreFloor > 0 ? '' : '（当前已关闭）'));
-    log('判定（9.3.0）：' +
-      '⓪多字终极关键词→全错 ⓪-2单字终极关键词(第4列也没有)→全错 ①关键词仅第3列→全错 ' +
+    log('判定（9.4.0）：' +
+      '①关键词：第3列命中的词第4列缺任一个→全错（已取消终极关键词） ' +
       '②匹配分<' + CONFIG.lowScoreFloor + '→全错（硬规则，不看子样本） ' +
       '③其余一律展开核对（得分=0/读不到的条不计入统计）：' +
       '低分(<' + CONFIG.lowScoreThreshold + ')条数 > 正确数据条数 → 全错（优先）；' +
