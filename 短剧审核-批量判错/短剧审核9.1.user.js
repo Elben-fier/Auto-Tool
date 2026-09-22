@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.4.1
+// @version      9.4.2
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（关键词双列比对、母本最高分(第5列)<90）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含关键词双列比对（命中词第4列缺任一即全错）、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -27,14 +27,17 @@
 //    相似度与母本最高分不再决定通过与否，只写进判定日志与判定理由（v9.1.7 起）。
 //  【术语】母本最高分 = 母本第5列 = 子样本单条分的最大值（面板「母本最高分」只影响日志标签，
 //      「母本最低线」=90 分底线：最高分低于它一律全错）；单条分 = 子样本第8列（高分≥93 / 低分<80）。
-//  【扫描与结束】每轮从面板「起始行号」往下扫；「已审核」只作边界（说明下面都已审过）；
+//  【扫描与结束】每轮从面板「起始行号」往下扫；只认**母本行**（9.4.2：子表行的 class 与母本行相同，
+//      必须用 isChildTableRow()/getParentRows() 排掉，否则会把展开区里的子样本行当成母本行）；
+//      「已审核」只作边界（说明下面都已审过）；
 //      第2列 id 读不到的异常行跳过继续看；扫不到可审行时点「查询」刷新确认两次，
 //      确认页面除「已审核」与「已跳过的异常数据」外没有未审核行 → 判定审核结束（v9.2.0）。
 //  【母本最高分读不到】先等加载完成并重读 N 次；仍读不到 = "母本还没刷新好" → 本轮跳过该合集、
 //      继续审别的行，刷新列表后自动重试，结束时汇总（不再中断整轮，v9.2.1）。
 //  【稳定性】严格等待加载（转圈闸门）、30s/60s 重试、异常永久跳过、慢处理档位（集数 > 300
 //      时所有等待闸门放宽，v9.1.9）、判定日志上报 POST /judge_log（v9.1.5）。
-//  【预演模式】面板勾选「预演（只判定不点击）」→ 判定链与上报照跑，但不点任何按钮（9.3.0），
+//  【预演模式】面板勾选「预演（只判定不点击）」→ 判定链与上报照跑，但不点任何按钮（9.3.0；9.4.2 起
+//      预演读完统计会把自己展开的合集收起，避免子表行留在 DOM 里），
 //      用于改规则后先在真实页面空跑核对结果。
 //  【版本号提醒】文件内部版本见上方 @version；历史文件「短剧审核9.0」也用过内部号 9.2.0，勿混淆。
 //  规则拆解：docs/短剧审核9.1判定机制详解.md ｜ 逐版本变更史：docs/版本演进记录.md
@@ -135,6 +138,8 @@
 
   // ========== 元素选择器 ==========
   const SELECTORS = {
+    // 母本行。注意：antd 的子表行同样带 ant-table-row-level-0，所以取母本行必须用
+    // getParentRows()（会排掉"展开区里的子表行"），不能直接用它全文档查 —— 见 9.4.2
     parentRow: 'tr.ant-table-row.ant-table-row-level-0',
     expandIcon: '.ant-table-row-expand-icon',
     parentIdCell: 'td:nth-child(2)',     // 合集ID（判定是否还是同一个）
@@ -625,6 +630,24 @@
   }
 
   // 收起合集：若当前已展开则再点一次展开按钮
+  // ========== 9.4.2：只取"母本行" ==========
+  // 母本行与子样本行的 class 都是 tr.ant-table-row.ant-table-row-level-0（antd 的 level 是"表内层级"，
+  // 子表自己也是 level-0），所以直接 document.querySelectorAll(SELECTORS.parentRow) 会把
+  // **展开区里的子表行**也当成母本行 —— 症状：日志里出现「母本最高分读不到（第5列原文「预览」）」、
+  // 短剧名是纯数字（其实是子样本状态码），而且一行一行慢慢跳（每行还要等重读）。
+  // 这里统一过滤：① 落在 tr.ant-table-expanded-row 里的行不要；② 嵌在另一个表格里的行不要。
+  function isChildTableRow(r) {
+    if (r.closest('tr.ant-table-expanded-row')) return true;      // 展开区里的子表行
+    const tbl = r.closest('.ant-pro-table, .ant-table-wrapper');
+    const outer = tbl && tbl.parentElement && tbl.parentElement.closest('.ant-pro-table, .ant-table-wrapper');
+    return !!outer;                                              // 嵌在另一个表格里 → 也是子表
+  }
+
+  // 取全部母本行（保持 DOM 顺序）
+  function getParentRows() {
+    return Array.from(qsa(document, SELECTORS.parentRow)).filter((r) => !isChildTableRow(r));
+  }
+
   async function collapseRow(parentRow) {
     const expandBtn = parentRow.querySelector(SELECTORS.expandIcon);
     if (!expandBtn) return;
@@ -648,7 +671,7 @@
 
     const tbody = R.closest('.ant-table-tbody') || document;
     const rowRect = R.getBoundingClientRect();
-    const rows = Array.from(qsa(document, SELECTORS.parentRow));
+    const rows = getParentRows();                       // 9.4.2：只按母本行算几何位置
     const idx = rows.indexOf(R);
     const nextTop = (idx >= 0 && rows[idx + 1])
       ? rows[idx + 1].getBoundingClientRect().top
@@ -778,7 +801,7 @@
     while (Date.now() - start < timeout) {
       if (!state.running) return 'stopped';
 
-      const rows = qsa(document, SELECTORS.parentRow);
+      const rows = getParentRows();                     // 9.4.2：只数母本行
       const cur = rows[state.workIndex];
       const loading = isLoading();
       if (loading) setStatus('全剧审核处理中（系统转圈中…）');
@@ -1154,15 +1177,25 @@
       log('===== 补充判定模式' + mode + '：' + reason + ' =====');
       setStatus('模式' + mode + '：' + reason);
       if (mode === 1) {
-        if (CONFIG.dryRun) return dryRunResult(1, reason);   // 9.3.0 预演：只判定不点击
+        if (CONFIG.dryRun) {
+          // 9.4.2：预演不点击，但要把本行为读统计而展开的子表收起来，
+          //   否则那 60 行子样本会一直留在 DOM 里干扰后面的扫描
+          await collapseRow(R);
+          log('🧪 预演：已收起本次为读统计而展开的合集');
+          return dryRunResult(1, reason);
+        }
         log('模式1 → 已展开，直接全剧审核（不勾选、不判错）');
         const r = await doFullReview(R, meta, null, expandedRow);
         return { result: r, mode: 1, reason: reason };
       }
     }
 
-    // ---- 9.3.0 预演模式：判定已出结果 → 直接返回，不点任何按钮 ----
-    if (CONFIG.dryRun) return dryRunResult(mode || 2, reason);
+    // ---- 9.3.0 预演模式：判定已出结果 → 收起展开的子表后返回，不点任何按钮 ----
+    if (CONFIG.dryRun) {
+      await collapseRow(R);                                 // 9.4.2：别把子表留在 DOM 里
+      log('🧪 预演：已收起本次为读统计而展开的合集');
+      return dryRunResult(mode || 2, reason);
+    }
 
     // ---- 模式2：全选 + 批量错误（等全部594）+ 全剧审核 ----
     // 注意：无论当前子样本是什么状态（哪怕没有 0），都必须执行"全选 + 批量错误"，不能跳过判错。
@@ -1240,7 +1273,7 @@
   //   · 第2列 id 读不到的行走不算候选（视为"还没刷新好"），跳过它继续往下看
   //   · 第一个可审行就是本轮目标；一个都没有 → done（再交给 confirmReviewFinished 刷新确认）
   function pickTarget() {
-    const rows = Array.from(qsa(document, SELECTORS.parentRow));
+    const rows = getParentRows();                        // 9.4.2：排除展开区里的子表行
     if (rows.length === 0) return { done: true, why: '页面无数据行' };
 
     const startIdx = Math.max(0, (CONFIG.startRow || 1) - 1);
@@ -1732,7 +1765,12 @@
   // 结构自检：输出首行解析到的 ID/名字/母本最高分/集数/状态，方便确认选择器是否失效
   function debugStructure() {
     try {
-      const rows = qsa(document, SELECTORS.parentRow);
+      const rows = getParentRows();                      // 9.4.2：只自检母本行
+      const allRows = Array.from(qsa(document, SELECTORS.parentRow));
+      if (allRows.length !== rows.length) {
+        console.log('[自检] 母本行 ' + rows.length + ' 行（已排除子表行 ' + (allRows.length - rows.length) +
+          ' 行；子表行与母本行 class 相同，必须靠 isChildTableRow() 排掉）');
+      }
       for (let i = 0; i < Math.min(2, rows.length); i++) {
         const meta = getCollectionMeta(rows[i]);
         const sim = checkSimilarOriginalName(rows[i], meta);
