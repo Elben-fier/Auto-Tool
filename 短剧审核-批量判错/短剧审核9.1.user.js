@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.1.8
-// @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；相似度×匹配分二维判定（所有文本都比对相似度）：相似且>95 → 直接全剧审核；相似且≤95 或 不相似且>95 → 展开按状态码 777 或 601 的条数（任一个>3）判定；不相似且≤95 / 匹配分读不到 → 直接全错；含终极关键词、关键词双列比对、30s/60s重试、永久跳过与严格等待加载
+// @version      9.1.9
+// @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（多字/单字终极关键词、普通关键词仅第3列、匹配分<低分下限）外一律展开核对：得分>95 的条数≥4 或 状态码 777/601 达标（子样本≤30条的小合集≥2、大合集≥4）→ 全剧审核；否则全选+批量错误后点「查询」刷新；含终极关键词、关键词双列比对、30s/60s重试、永久跳过、严格等待加载与慢处理档位
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
 // @grant        GM_setClipboard
@@ -11,6 +11,22 @@
 // @connect      localhost
 // @run-at       document-end
 // ==/UserScript==
+
+// ============================== 9.1.9 慢处理档位全量生效（补齐未接线的等待闸门） ==============================
+//  【背景】"慢处理"（集数 > slowEpisodeThreshold=300）本意是给大合集更宽的等待上限，
+//          但原实现只接了 7 处；下面这些关键等待点无论快慢都按"普通"档位走：
+//            · expandRowAndWait 内部"展开后等加载完成"（原固定用 loadingWaitMax）
+//            · clickRowButton「点击按钮前」转圈闸门（原固定 loadingWaitMax）
+//            · clickQuery「点击查询前」转圈闸门（原固定 loadingWaitMax）
+//            · 模式2「勾选子样本前 / 勾选后等待就绪」两处闸门（原固定 loadingWaitMax）
+//            · clickConfirm「确认弹窗就绪」等待（原硬编码 20000ms）
+//          => 慢合集在这些点上并不更宽容，"慢处理"其实只生效了一半。
+//  【本次】新增 state.curSlow（进入 processOneCollection 时按 meta.isSlow 登记）+ loadWaitMax()：
+//          以上闸门统一走 loadWaitMax()（慢合集取 loadingWaitMaxSlow）；
+//          「确认弹窗就绪」新增独立档位 confirmReadyWaitMax(20s) / confirmReadyWaitMaxSlow(40s)。
+//  【不变】判定规则、模式1/模式2 流程，以及展开/判错/全剧审核/等待移走的既有档位全部不动。
+//  【顺带】上报字段 version 由硬编码的 9.1.5 改为跟随本版本；修正 matchMode 的过期注释。
+// ==========================================================================
 
 // ============================== 9.1.8 601/777 门槛按合集大小分档 ==============================
 //  【需求】"存在两个 601 或 777 也是对的" —— 但门槛不能一概而论，要看母本展开的数据量：
@@ -164,6 +180,8 @@
     loadingCalmMs: 800,            // 连续多少毫秒无转圈才算"加载完成"
     // —— 弹窗/按钮 ——
     modalWaitMax: 8000,            // 确认弹窗最长等待
+    confirmReadyWaitMax: 20000,    // 9.1.9：点确认前的"弹窗就绪"等待（配合严格等待）
+    confirmReadyWaitMaxSlow: 40000,// 9.1.9：慢合集的"弹窗就绪"等待（放宽；原来硬编码 20s，慢合集也只有一个档）
     batchBtnWaitMax: 5000,         // 按钮从禁用变可用最长等待
     checkInterval: 500,            // 轮询间隔
     // —— 关键词规则（8.0：双列比对）——
@@ -201,6 +219,7 @@
     skipList: [],        // 跳过明细：{id,name,reason,time}
     judgeDone: 0,        // 594已完成数
     judgeNeed: 0,        // 594需要总数
+    curSlow: false,      // 9.1.9：当前合集是否按"慢处理"档位等待（集数 > slowEpisodeThreshold）
   };
 
   // ========== 元素选择器 ==========
@@ -270,6 +289,13 @@
     if (!el || !el.isConnected) return false;
     try { el.click(); return true; }
     catch (e) { console.warn('[短剧9.1] 点击失败:', e.message || e); return false; }
+  }
+
+  // 9.1.9：当前合集的「等待加载完成」上限——慢合集取更宽的档位
+  // 原实现只有部分位置判断了慢处理，导致 expandRowAndWait 内部、点击前闸门、勾选前后闸门
+  // 无论快慢都按普通档走；这里统一取值，让「慢处理」真正全量生效。
+  function loadWaitMax() {
+    return state.curSlow ? CONFIG.loadingWaitMaxSlow : CONFIG.loadingWaitMax;
   }
 
   // ========== 严格等待加载完成（antd 转圈闸门） ==========
@@ -356,10 +382,14 @@
   }
 
   // 确认弹窗增强点击（7.0：点确定前也要求页面无转圈）
+  // 9.1.9：等待弹窗就绪的档位也按"慢处理"分档（原来慢合集也只有硬编码的 20s）
   async function clickConfirm(timeout) {
     const confirmBtn = await waitForConfirmBtn(timeout);
     if (!confirmBtn) return false;
-    if (CONFIG.strictLoading) await waitLoadingDone('确认弹窗就绪', 20000);
+    if (CONFIG.strictLoading) {
+      await waitLoadingDone('确认弹窗就绪',
+        state.curSlow ? CONFIG.confirmReadyWaitMaxSlow : CONFIG.confirmReadyWaitMax);
+    }
     confirmBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     safeClick(confirmBtn);
     confirmBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
@@ -633,7 +663,7 @@
     while (Date.now() - start < timeout) {
       if (!state.running) throw new Error('已停止');
       if (getChildRows(expandedRow).length > 0) {
-        const wait = CONFIG.loadingWaitMax;
+        const wait = loadWaitMax();   // 9.1.9：慢合集走 loadingWaitMaxSlow
         if (CONFIG.strictLoading && !(await waitLoadingDone('合集展开后加载', wait))) {
           throw new Error('展开后加载未完成（转圈未结束）');
         }
@@ -687,7 +717,7 @@
   // 返回 true=已提交 | false=未提交
   async function clickRowButton(R, btnText, expandedRow) {
     // 7.0 严格等待：点击前页面必须已无转圈（否则点击可能无效/被覆盖）
-    if (CONFIG.strictLoading && !(await waitLoadingDone('点击「' + btnText + '」前'))) return false;
+    if (CONFIG.strictLoading && !(await waitLoadingDone('点击「' + btnText + '」前', loadWaitMax()))) return false;
 
     const btn = findRowButton(R, btnText, expandedRow);
     if (!btn) { console.warn('[按钮] 本行范围内未找到「' + btnText + '」'); return false; }
@@ -841,7 +871,7 @@
 
   // 点击「查询」；返回是否点通
   async function clickQuery() {
-    if (CONFIG.strictLoading && !(await waitLoadingDone('点击「' + CONFIG.queryBtnText + '」前'))) return false;
+    if (CONFIG.strictLoading && !(await waitLoadingDone('点击「' + CONFIG.queryBtnText + '」前', loadWaitMax()))) return false;
     const btn = findQueryButton();
     if (!btn) {
       log('⚠️ 未找到「' + CONFIG.queryBtnText + '」按钮（页面可能改版；继续等待列表刷新）');
@@ -909,7 +939,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.1',
-      version: '9.1.5',
+      version: '9.1.9',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -923,7 +953,7 @@
       keyword: c.kw || '',
       keywordDual: !!c.dual,
       ultimate: c.ultimate || '',
-      matchMode: c.matchMode || '',             // 展开核对类型：high / codes / 空
+      matchMode: c.matchMode || '',             // 展开核对类型：similar-high / similar / dissimilar-high / dissimilar / no-score
       mode: res.mode || 0,
       result: res.result || '',
       outcome: res.result === 'ok'
@@ -1011,6 +1041,8 @@
   // 相似度判据（所有文本都比对）：连续 similarMinSubstr 字相同 或 公共不同字 ≥ similarMinCommonChars
   // 返回 { result: 'ok'|'problem', mode: 1|2, reason }
   async function processOneCollection(R, meta) {
+    // 9.1.9：登记本合集是否慢处理 → 所有「等待加载完成」闸门统一由 loadWaitMax() 取值
+    state.curSlow = !!meta.isSlow;
     const expandWait = meta.isSlow ? CONFIG.expandWaitMaxSlow : CONFIG.expandWaitMax;
     const expandFn = () => expandRowAndWait(R, expandWait);
 
@@ -1158,7 +1190,7 @@
     // ---- 模式2：全选 + 批量错误（等全部594）+ 全剧审核 ----
     // 注意：无论当前子样本是什么状态（哪怕没有 0），都必须执行"全选 + 批量错误"，不能跳过判错。
     // 严格等待：勾选前确保子表已渲染完（无转圈）
-    if (CONFIG.strictLoading && !(await waitLoadingDone('勾选子样本前', CONFIG.loadingWaitMax))) {
+    if (CONFIG.strictLoading && !(await waitLoadingDone('勾选子样本前', loadWaitMax()))) {
       return { result: 'problem', mode: 2 };
     }
     setStatus('模式2 · 全选子样本 ' + stats.total + ' 条...');
@@ -1171,7 +1203,7 @@
       return { result: 'problem', mode: 2 };
     }
     // 7.0 严格等待：勾选后也可能触发渲染/请求，等加载结束再点「批量错误」
-    if (CONFIG.strictLoading && !(await waitLoadingDone('勾选后等待就绪', CONFIG.loadingWaitMax))) {
+    if (CONFIG.strictLoading && !(await waitLoadingDone('勾选后等待就绪', loadWaitMax()))) {
       return { result: 'problem', mode: 2 };
     }
 
@@ -1448,7 +1480,7 @@
         <div class="form-row">
           <label>慢处理集数：</label>
           <input type="number" id="slow-threshold" value="${CONFIG.slowEpisodeThreshold}" min="1">
-          <span>集以上</span>
+          <span>集以上（等待档位全部放宽）</span>
         </div>
         <div class="form-row">
           <label class="p9-check"><input type="checkbox" id="strict-loading" ${CONFIG.strictLoading ? 'checked' : ''}> <b>严格等待加载完成</b></label>
@@ -1560,6 +1592,7 @@
     state.noScoreLastIdx = -1;
     state.doneIds = new Set();
     state.lastJudge = null;
+    state.curSlow = false;      // 9.1.9：本轮开始前重置"慢处理"档位
     reportCooldownUntil = 0;
     reportWarned = false;
     reportOkLogged = false;
@@ -1573,7 +1606,8 @@
     log('===== 开始运行（从第' + CONFIG.startRow + '行起）=====');
     log('严格等待加载完成：' + (CONFIG.strictLoading ? '开（转圈消失才点下一步）' : '关') +
       '；等待上限 普通' + Math.round(CONFIG.loadingWaitMax / 1000) + 's / 慢合集' +
-      Math.round(CONFIG.loadingWaitMaxSlow / 1000) + 's');
+      Math.round(CONFIG.loadingWaitMaxSlow / 1000) + 's（9.1.9 起展开后加载、点击前/勾选前后闸门、' +
+      '确认弹窗就绪都按此分档）');
     log('等待重试：第 ' + CONFIG.retryAtSec.join('s、') + 's 各重试点击一次（每按钮最多3次）；' +
       '仍无响应 → 永久跳过该合集换下一行（最多跳过 ' + CONFIG.maxSkipCount + ' 个）');
     log('安全保护：连续 ' + CONFIG.noScoreStopCount + ' 行匹配分读不到 → 立即停止运行' +
