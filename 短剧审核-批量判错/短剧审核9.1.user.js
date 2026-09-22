@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.1.9
+// @version      9.2.0
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（多字/单字终极关键词、普通关键词仅第3列、匹配分<低分下限）外一律展开核对：得分>95 的条数≥4 或 状态码 777/601 达标（子样本≤30条的小合集≥2、大合集≥4）→ 全剧审核；否则全选+批量错误后点「查询」刷新；含终极关键词、关键词双列比对、30s/60s重试、永久跳过、严格等待加载与慢处理档位
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -11,6 +11,22 @@
 // @connect      localhost
 // @run-at       document-end
 // ==/UserScript==
+
+// ============================== 9.2.0 扫描与结束判定（已审核=边界 + 结束前刷新确认） ==============================
+//  【需求】"遇到已审核说明下面的数据都已经是审核过的了；看看是不是第一行，不是就说明可以往回审核试试；
+//          遇到展开异常/母本没匹配分的说明该母本还没刷新好；能审则审，然后就说明审核结束了"
+//  【本次】
+//    ① pickTarget 改为【每一轮都从「起始行」往下扫】（不再沿用上一轮的下标）：
+//       面板「起始行号」= 每轮的扫描起点；原"往下续扫 + 回绕到前面"的机制取消（每轮从顶扫本就覆盖全部）。
+//    ② 「已审核」只作边界标记，不再当可审行（说明下面都已审过）；扫到的第一个可审行就是本轮目标。
+//    ③ 第2列 id 读不到的行 → 视为"还没刷新好"的异常行：跳过它继续往下看，
+//       不再像以前那样"一读不到就整脚本停止"；只有【整段所有行】id 都读不到才判为页面改版并停止。
+//    ④ 扫不到可审行时不再立刻收工：先点「查询」刷新列表确认（默认两次 endConfirmRounds=2），
+//       每次等加载完成 + endConfirmSettleMs(1.5s) 稳定后重扫；仍无可审行 → 判定审核结束。
+//    ⑤ "审完"的口径 = 页面除了【已审核】与【已跳过的异常数据】之外，没有未审核行。
+//  【不变】判定规则、模式1/模式2 流程、展开/判错/全剧审核/各类等待，
+//          以及"相邻多行读不到匹配分即停止"的既有保护。
+// ==========================================================================
 
 // ============================== 9.1.9 慢处理档位全量生效（补齐未接线的等待闸门） ==============================
 //  【背景】"慢处理"（集数 > slowEpisodeThreshold=300）本意是给大合集更宽的等待上限，
@@ -151,6 +167,8 @@
     highScoreThreshold: 95,        // 【展开核对】子样本得分(第8列) > 该值 视为"高分明细"
     highScoreMinCount: 4,          // 【展开核对】高分明细 ≥ 该条数 → 模式1（全剧审核）
     queryBtnText: '查询',          // 全错处理后的收尾：点击页面「查询」按钮刷新列表（不再点全剧审核）
+    endConfirmRounds: 2,           // 9.2.0：扫不到可审行时，点「查询」刷新确认的次数（0=不确认直接结束）
+    endConfirmSettleMs: 1500,      // 9.2.0：每次刷新确认后额外的稳定等待(ms)，等列表重排完再重扫
     lowScoreFloor: 90,             // 【低分保护】匹配分 < 该值 → 一律全错（不看 777/601，不可能通过）；0=关闭
     judgeCodes: ['777', '601'],    // 需要展开时统计的子样本状态码（两个码各自计数）
     correctCodeMinCount: 4,        // 【大合集】任一 judgeCode 的条数 ≥ 该值 → 模式1（子样本 > smallCollectionMaxRows 条时用）
@@ -939,7 +957,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.1',
-      version: '9.1.9',
+      version: '9.2.0',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -1255,43 +1273,86 @@
     return { result: 'ok', mode: 2, reason: reason };
   }
 
-  // ========== 主循环（8.0：id 唯一 + 永久跳过） ==========
-  // 选取目标行：从 workIndex 开始往后找第一个「id 未跳过 且 状态不是已审核」的合集
-  // 找不到 → 全部处理完成
+  // ========== 主循环（8.0：id 唯一 + 永久跳过；9.2.0：每轮从"起始行"往下扫 + 已审核为边界） ==========
+  // 9.2.0 扫描规则（按需求："遇到已审核说明下面都审过了"）：
+  //   · 每一轮都从【起始行】往下扫，不再沿用上一轮的下标（列表刷新后会重排/补位）
+  //   · 「已审核」行只作边界标记（下面都已审过），本身不再当可审行
+  //   · 跳过：本轮已处理过(doneIds) / 已永久跳过=异常数据(skipIds) / 状态含「已审核」
+  //   · 第2列 id 读不到的行走不算候选（视为"还没刷新好"），跳过它继续往下看
+  //   · 第一个可审行就是本轮目标；一个都没有 → done（再交给 confirmReviewFinished 刷新确认）
   function pickTarget() {
     const rows = Array.from(qsa(document, SELECTORS.parentRow));
     if (rows.length === 0) return { done: true, why: '页面无数据行' };
 
-    // 先检查 id 是否可读（第2列是唯一标识，读不到不能靠文本兜底）
-    const check = (i) => {
+    const startIdx = Math.max(0, (CONFIG.startRow || 1) - 1);
+    if (startIdx >= rows.length) {
+      return { done: true, why: '起始行第' + (startIdx + 1) + '行超出当前列表（共 ' + rows.length + ' 行）→ 无可审行' };
+    }
+    let firstReviewedIdx = -1;   // 第一行「已审核」的位置（边界）
+    let unreadableId = 0;        // 第2列读不到的行数（"还没刷新好"的迹象）
+
+    for (let i = startIdx; i < rows.length; i++) {
       const R = rows[i];
+      if (getRowStatus(R).includes('已审核')) {          // 9.2.0：已审核 = 边界（下面都审过了）
+        if (firstReviewedIdx < 0) firstReviewedIdx = i;
+        continue;
+      }
       const meta = getCollectionMeta(R);
       if (!meta.id) {
-        return { done: true, why: '第' + (i + 1) + '行第2列(合集id)读取为空，可能是页面改版 → 停止运行，请检查第2列选择器' };
+        unreadableId++;
+        log('⚠️ 第' + (i + 1) + '行第2列(合集id)读不到 → 视为还没刷新好的异常行，先跳过、继续往下看');
+        continue;
       }
-      if (state.skipIds.has(meta.id)) return null;            // 已永久跳过
-      if (state.doneIds.has(meta.id)) return null;            // 9.1.3：本轮已处理过（查询后可能仍留在列表里）
-      if (getRowStatus(R).includes('已审核')) return null;     // 已审核 → 跳过
-      return { R: R, meta: meta, idx: i };
-    };
+      if (state.skipIds.has(meta.id)) continue;          // 异常数据（本轮已永久跳过）
+      if (state.doneIds.has(meta.id)) continue;          // 本轮已处理过
+      state.workIndex = i;
+      return { R: R, meta: meta, idx: i, boundary: firstReviewedIdx, unreadableId: unreadableId };
+    }
 
-    // 第一遍：从当前工作行往后找
-    for (let i = state.workIndex; i < rows.length; i++) {
-      const r = check(i);
-      if (!r) continue;
-      if (r.done) return r;
-      state.workIndex = r.idx;
-      return r;
+    // 整段（起始行往下）没有一个可审行
+    if (unreadableId > 0 && unreadableId === rows.length - startIdx) {
+      return { done: true, abort: true,
+        why: '从第' + (startIdx + 1) + '行起，第2列(合集id)全部读取为空，疑似页面改版 → 停止运行，请检查第2列选择器' };
     }
-    // 第二遍：回绕到前面找（避免跳过后漏掉前面的行）
-    for (let i = 0; i < Math.min(state.workIndex, rows.length); i++) {
-      const r = check(i);
-      if (!r) continue;
-      if (r.done) return r;
-      state.workIndex = r.idx;
-      return r;
+    return {
+      done: true,
+      boundary: firstReviewedIdx,
+      unreadableId: unreadableId,
+      why: (firstReviewedIdx === startIdx
+        ? '第' + (startIdx + 1) + '行已是「已审核」→ 说明下面的数据都已审核过'
+        : '全表只剩「已审核」与已跳过的异常数据') +
+        (unreadableId > 0 ? '（另有 ' + unreadableId + ' 行还没刷新好）' : ''),
+    };
+  }
+
+  // ========== 9.2.0：结束前的「查询」刷新确认 ==========
+  // 扫不到可审行时先别急着收工：列表可能还在刷新（母本没匹配分 / 展开异常都可能是"还没刷新好"），
+  // 所以点「查询」刷新列表再看一眼 —— 默认点两次（CONFIG.endConfirmRounds）。
+  // 返回：刷新后出现的可审行对象（说明还没审完，继续审） | null（确认已审完）
+  async function confirmReviewFinished(why) {
+    const rounds = Math.max(0, CONFIG.endConfirmRounds | 0);
+    if (rounds === 0) return null;
+
+    for (let r = 1; r <= rounds; r++) {
+      if (!state.running) return null;
+      log('🔎 扫描结果：' + why + ' → 第 ' + r + '/' + rounds + ' 次点击「' +
+        CONFIG.queryBtnText + '」刷新确认...');
+      setStatus('刷新确认中（' + r + '/' + rounds + '）...');
+
+      if (!(await clickQuery())) log('⚠️ 「' + CONFIG.queryBtnText + '」未点通，继续等列表刷新后再看');
+      if (CONFIG.strictLoading && !(await waitLoadingDone('「' + CONFIG.queryBtnText + '」刷新确认', loadWaitMax()))) {
+        log('⚠️ 刷新确认等待超时，仍再看一眼列表');
+      }
+      await delay(CONFIG.endConfirmSettleMs);
+
+      const t = pickTarget();
+      if (!t.done) {
+        log('✅ 刷新后出现可审行（第' + (t.idx + 1) + '行）→ 继续审核');
+        return t;
+      }
+      log('　↳ 第 ' + r + ' 次刷新后仍无可审行' + (t.why ? '（' + t.why + '）' : ''));
     }
-    return { done: true, why: '已无可处理的合集（其余均为已审核或已跳过）' };
+    return null;
   }
 
   async function runLoop() {
@@ -1299,11 +1360,18 @@
     let abortReason = '';       // 9.1 保护：非正常停止的原因（连续读不到匹配分）
     while (state.running) {
       try {
-        const target = pickTarget();
+        let target = pickTarget();
         if (target.done) {
+          if (target.abort) {                       // 整段 id 都读不到 → 页面改版，仍按"立即停止"处理
+            abortReason = target.why;
+            log('⛔ ' + target.why);
+            setStatus('⛔ ' + target.why);
+            break;
+          }
           log(target.why);
-          done = true;
-          break;
+          // 9.2.0：结束前先点「查询」刷新确认（默认两次）；刷新后若又出现未审核行 → 继续审
+          target = await confirmReviewFinished(target.why);
+          if (!target) { done = true; break; }
         }
 
         const R = target.R, meta = target.meta;
@@ -1388,7 +1456,7 @@
     if (!done && abortReason) {
       setTimeout(() => alert('⚠️ 脚本已自动停止\n原因：' + abortReason +
         '\n\n已处理 ' + state.processedCount + ' 个合集；本行及之后的行未处理。' +
-        '\n请按 F12 查看控制台「自检」输出，确认第5列（匹配分）选择器是否失效。'), 100);
+        '\n请按 F12 查看控制台「自检」输出，确认 SELECTORS（第2列 id / 第5列匹配分）是否失效。'), 100);
     }
     if (done) {
       const skipText = state.skipList.length > 0
@@ -1397,7 +1465,9 @@
            (state.skipList.length > 10 ? '\n …（其余见面板「复制跳过清单」）' : ''))
         : '\n（无跳过合集）';
       setTimeout(() => alert('处理完成！共处理 ' + state.processedCount + ' 个合集\n模式1(直接全剧审核) ' +
-        state.mode1Count + ' 个 / 模式2(全选判错) ' + state.mode2Count + ' 个' + skipText), 100);
+        state.mode1Count + ' 个 / 模式2(全选判错) ' + state.mode2Count + ' 个' +
+        '\n结束确认：已点「' + CONFIG.queryBtnText + '」刷新 ' + CONFIG.endConfirmRounds +
+        ' 次，未再发现未审核行' + skipText), 100);
     }
   }
 
@@ -1460,7 +1530,7 @@
         <div class="form-row">
           <label>起始行号：</label>
           <input type="number" id="start-row" value="${CONFIG.startRow}" min="1">
-          <span>行</span>
+          <span>行（每轮扫描起点）</span>
         </div>
         <div class="form-row">
           <label>匹配分阈值：</label>
@@ -1612,6 +1682,9 @@
       '仍无响应 → 永久跳过该合集换下一行（最多跳过 ' + CONFIG.maxSkipCount + ' 个）');
     log('安全保护：连续 ' + CONFIG.noScoreStopCount + ' 行匹配分读不到 → 立即停止运行' +
       (CONFIG.noScoreStopCount > 0 ? '' : '（当前已关闭）'));
+    log('扫描与结束（9.2.0）：每轮从第' + CONFIG.startRow + '行往下扫；「已审核」视为边界（下面都已审过）；' +
+      '第2列 id 读不到的异常行跳过继续看；扫不到可审行时点「' + CONFIG.queryBtnText + '」刷新确认 ' +
+      CONFIG.endConfirmRounds + ' 次，确认没有未审核行才判定审核结束');
     log('终极关键词：多字命中即全错，单字（' +
       CONFIG.ultimateKeywords.filter((k) => k && k.length === 1).join('、') +
       '）改为双列比对（第4列也有则不判错）｜当前表：' + CONFIG.ultimateKeywords.join('、'));
