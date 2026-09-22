@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.2.2
-// @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（多字/单字终极关键词、普通关键词仅第3列、匹配分<低分下限）外一律展开核对：得分>95 的条数≥4 或 状态码 777/601 达标（子样本≤30条的小合集≥2、大合集≥4）→ 全剧审核；否则全选+批量错误后点「查询」刷新；含终极关键词、关键词双列比对、30s/60s重试、永久跳过、严格等待加载与慢处理档位
+// @version      9.3.0
+// @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（多字/单字终极关键词、普通关键词仅第3列、匹配分<低分下限）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含终极关键词、关键词双列比对、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
 // @grant        GM_setClipboard
@@ -17,9 +17,12 @@
 //      ⓪ 多字终极关键词命中第3列 ⓪-2 单字终极关键词「画」(且第4列也没有该字)
 //      ① 普通关键词仅出现在第3列 ② 匹配分 < lowScoreFloor(默认90)
 //    其余一切情况（相似/不相似、匹配分高低/读不到）→【展开核对】：
-//      子样本得分(第8列) > 95 的条数 ≥ 4  或  状态码 777/601 各自达标
-//      （子样本 ≤ 30 条的小合集 ≥ 2；> 30 条的大合集 ≥ 4）→ 模式1（点「全剧审核」）
-//      都不满足 → 模式2（全选 + 批量错误 → 等全部 594 → 点页面「查询」刷新列表）
+//      · 子样本得分 = 0 或读不到的行走 =「还没刷新出来」→ 整行不计入任何统计（9.3.0）
+//      · 低分(<80)条数 > 正确数据条数 → 模式2 全错（9.3.0 新增，优先于"高分够多"）
+//      · 否则 得分≥93 的条数 ≥ 4 或 状态码 777/601 各自达标
+//        （有效行 ≤ 30 条的小合集 ≥ 2；> 30 条的大合集 ≥ 4）→ 模式1（点「全剧审核」）
+//      · 都不满足 → 模式2（全选 + 批量错误 → 等全部 594 → 点页面「查询」刷新列表）
+//    "正确数据" = 判定码 777/601 或 得分≥93（同一行只算一次）。
 //    相似度与匹配分不再决定通过与否，只写进判定日志与判定理由（v9.1.7 起）。
 //  【扫描与结束】每轮从面板「起始行号」往下扫；「已审核」只作边界（说明下面都已审过）；
 //      第2列 id 读不到的异常行跳过继续看；扫不到可审行时点「查询」刷新确认两次，
@@ -28,6 +31,8 @@
 //      继续审别的行，刷新列表后自动重试，结束时汇总（不再中断整轮，v9.2.1）。
 //  【稳定性】严格等待加载（转圈闸门）、30s/60s 重试、异常永久跳过、慢处理档位（集数 > 300
 //      时所有等待闸门放宽，v9.1.9）、判定日志上报 POST /judge_log（v9.1.5）。
+//  【预演模式】面板勾选「预演（只判定不点击）」→ 判定链与上报照跑，但不点任何按钮（9.3.0），
+//      用于改规则后先在真实页面空跑核对结果。
 //  【版本号提醒】文件内部版本见上方 @version；历史文件「短剧审核9.0」也用过内部号 9.2.0，勿混淆。
 //  规则拆解：docs/短剧审核9.1判定机制详解.md ｜ 逐版本变更史：docs/版本演进记录.md
 //  注：9.2.2 仅把原先堆在这里的 164 行逐版变更记录并入上述文档，脚本代码未改动。
@@ -42,7 +47,9 @@
   const CONFIG = {
     // —— 模式判定（9.1.0：相似度 × 匹配分 二维判定）——
     parentScoreThreshold: 95,      // 匹配最高分(第5列)：相似 且 > 该值 → 展开核对高分明细（9.1.3）
-    highScoreThreshold: 95,        // 【展开核对】子样本得分(第8列) > 该值 视为"高分明细"
+    highScoreThreshold: 93,        // 【展开核对】子样本得分(第8列) ≥ 该值 视为"高分数据"（9.3.0：95 → 93）
+    lowScoreThreshold: 80,         // 9.3.0：子样本得分(第8列) 在 (0, 该值) 之间 视为"低分数据"
+    dryRun: false,                 // 9.3.0：预演模式——判定与上报照跑，但不点任何按钮（面板可勾选，用于验证规则）
     highScoreMinCount: 4,          // 【展开核对】高分明细 ≥ 该条数 → 模式1（全剧审核）
     queryBtnText: '查询',          // 全错处理后的收尾：点击页面「查询」按钮刷新列表（不再点全剧审核）
     endConfirmRounds: 2,           // 9.2.0：扫不到可审行时，点「查询」刷新确认的次数（0=不确认直接结束）
@@ -499,42 +506,58 @@
     return txt.length > 160 ? txt.slice(0, 160) + '…' : txt;
   }
 
-  // 汇总当前展开子表：状态码分布 + 各 judgeCode(777/601) 条数 + 可读得分条数
+  // 汇总当前展开子表：状态码分布 + 各 judgeCode(777/601) 条数 + 得分分层
   // 9.1.1：展开判定用"777 或 601 的条数（各自计数）"，故这里统计 judgeCounts
+  // 9.3.0：得分 = 0 或读不到的行走 =「这条还没刷新出来」→ 不计入 base/低分/高分/正确数据；
+  //         但 594 进度（wrong/notWrong）与判定码计数仍按全部行统计，避免影响"等全部594"的判定。
   function getCodeStats(expandedRow) {
     const rows = getChildRows(expandedRow);
     const counters = {};
     let unjudged = 0;
     let scoreKnown = 0;         // 能读到得分的条数（便于排查列错）
-    let scoreHigh = 0;          // 9.1.3：得分 > highScoreThreshold 的条数（"高分明细"）
+    let scoreHigh = 0;          // 得分 ≥ highScoreThreshold(93) 的条数
+    let scoreLow = 0;           // 9.3.0：0 < 得分 < lowScoreThreshold(80) 的条数
+    let notReady = 0;           // 9.3.0：得分 = 0 或读不到 → 视为还没刷新，不计入判定统计
+    let correct = 0;            // 9.3.0：正确数据行数（判定码 777/601 或 高分；同一行只算一次）
     const judgeCounts = {};     // 9.1.1：各 judgeCode 的子样本条数，如 {777: 5, 601: 0}
     CONFIG.judgeCodes.forEach((c) => { judgeCounts[c] = 0; });
     rows.forEach((row) => {
+      const sc = parseNum(cellText(row, SELECTORS.childScoreCell));
+      const notReadyRow = (sc === null || sc === 0);   // 9.3.0：0 分/读不到 = 还没刷新出来
+
       const code = getChildCode(row);
       counters[code] = (counters[code] || 0) + 1;
       // 空值也视为未判定（避免列结构异常时被误认为已完成）
       if (code === CONFIG.unjudgedCode || code === '') unjudged++;
-      if (CONFIG.judgeCodes.includes(code)) judgeCounts[code] = (judgeCounts[code] || 0) + 1;
+      const isJudgeCode = CONFIG.judgeCodes.includes(code);
+      if (isJudgeCode) judgeCounts[code] = (judgeCounts[code] || 0) + 1;
 
-      const sc = parseNum(cellText(row, SELECTORS.childScoreCell));
-      if (sc !== null) {
-        scoreKnown++;
-        if (sc > CONFIG.highScoreThreshold) scoreHigh++;
-      }
+      if (notReadyRow) { notReady++; return; }         // 该行不再参与 base/低分/高分/正确数据
+
+      scoreKnown++;
+      const isHigh = sc >= CONFIG.highScoreThreshold;
+      if (isHigh) scoreHigh++;
+      else if (sc < CONFIG.lowScoreThreshold) scoreLow++;
+      if (isJudgeCode || isHigh) correct++;
     });
     const detail = Object.keys(counters)
       .map((k) => (k === '' ? '(空)' : k) + '×' + counters[k])
       .join(', ');
     const wrongCount = counters[CONFIG.wrongCode] || 0;
+    const validRows = rows.length - notReady;
     return {
-      total: rows.length,
+      total: rows.length,                // 展开后渲染出的全部行数
+      valid: validRows,                  // 9.3.0：有效行数（不含 0 分/读不到）
+      notReady: notReady,                // 9.3.0：0 分/读不到的行数
       unjudged: unjudged,
-      wrong: wrongCount,                 // 已是 594 的行数
-      notWrong: rows.length - wrongCount, // 还不是 594 的行数（含 0 与其它状态码）
+      wrong: wrongCount,                 // 已是 594 的行数（全部行，含没刷新的）
+      notWrong: rows.length - wrongCount, // 还不是 594 的行数（等"全部594"按全部行算）
       counters: counters,
       detail: detail,
       judgeCounts: judgeCounts,          // 各 judgeCode 的条数
-      scoreHigh: scoreHigh,              // 得分 > highScoreThreshold 的条数
+      scoreHigh: scoreHigh,              // 得分 ≥ highScoreThreshold 的条数
+      scoreLow: scoreLow,                // 9.3.0：低分条数
+      correct: correct,                  // 9.3.0：正确数据条数（去重后）
       scoreKnown: scoreKnown,
     };
   }
@@ -877,7 +900,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.1',
-      version: '9.2.2',
+      version: '9.3.0',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -886,6 +909,7 @@
       score: meta.score,
       episodes: meta.episodes,
       isSlow: !!meta.isSlow,
+      dryRun: !!CONFIG.dryRun,                  // 9.3.0：本条是否为预演（未执行点击）
       similar: !!c.similar,
       simDetail: c.simDetail || '',
       keyword: c.kw || '',
@@ -894,9 +918,11 @@
       matchMode: c.matchMode || '',             // 展开核对类型：similar-high / similar / dissimilar-high / dissimilar / no-score
       mode: res.mode || 0,
       result: res.result || '',
-      outcome: res.result === 'ok'
-        ? (res.mode === 1 ? '通过(全剧审核)' : '全错(批量错误)')
-        : '异常/跳过',
+      outcome: CONFIG.dryRun
+        ? ('预演(未点击) · 本应' + (res.mode === 1 ? '通过(全剧审核)' : '全错(批量错误)'))
+        : (res.result === 'ok'
+            ? (res.mode === 1 ? '通过(全剧审核)' : '全错(批量错误)')
+            : '异常/跳过'),
       reason: res.reason || '',
       counts: {
         total: counts.total || 0,
@@ -962,6 +988,15 @@
         reportCooldownUntil = Date.now() + CONFIG.reportRetryCooldownMs;
       },
     });
+  }
+
+  // ========== 9.3.0：预演模式的结果对象 ==========
+  // 预演 = 判定链与日志上报照跑，但绝不点击任何按钮（全剧审核 / 批量错误 / 查询刷新都不点）。
+  // 用途：改判定规则后，先在真实页面空跑一轮核对结果，确认无误再关掉预演正式跑。
+  function dryRunResult(mode, reason) {
+    log('🧪 预演：本应执行【模式' + mode +
+      (mode === 1 ? '：全剧审核（判正确）' : '：全选 + 批量错误 + 查询刷新（判全错）') + '】——未点击任何按钮');
+    return { result: 'ok', mode: mode, reason: reason + '（预演：未执行任何点击）', dryRun: true };
   }
 
   // ========== 处理单个合集（9.1.3 判定：相似度 × 匹配分 + 低分保护 + 展开核对） ==========
@@ -1085,45 +1120,64 @@
       };
     }
 
-    // 9.1.1：各判定码的条数，如 "777 5 条 / 601 0 条"；9.1.3：再加"得分 > 95 的条数"
+    // 9.1.1：各判定码的条数，如 "777 5 条 / 601 0 条"；9.3.0：再加"得分≥93 / 低分<80 / 正确数据"条数
     const judgeText = CONFIG.judgeCodes.map((c) => c + ' ' + (stats.judgeCounts[c] || 0) + ' 条').join(' / ');
     log('子样本统计：共 ' + stats.total + ' 条 | 状态码 ' + stats.detail +
-      ' | ' + judgeText + ' | 得分>' + CONFIG.highScoreThreshold + ' ' + stats.scoreHigh + ' 条' +
+      ' | ' + judgeText + ' | 得分≥' + CONFIG.highScoreThreshold + ' ' + stats.scoreHigh + ' 条' +
+      ' | 低分<' + CONFIG.lowScoreThreshold + ' ' + stats.scoreLow + ' 条' +
+      ' | 正确数据 ' + stats.correct + ' 条' +
+      ' | 有效 ' + stats.valid + ' 条' + (stats.notReady > 0 ? ('（' + stats.notReady + ' 条 0分/读不到未计入）') : '') +
       ' | 已打594 ' + stats.wrong + ' 条(可读得分 ' + stats.scoreKnown + ' 条)');
 
     // ---- 待定 → 按展开核对结果判定 ----
     if (needExpand) {
-      // 9.1.7：展开核对统一判据（所有分支同一套）
-      //   ① 高分数据够多：得分 > highScoreThreshold 的条数 ≥ highScoreMinCount
+      // 9.3.0 展开核对判据（书写顺序即优先级）：
+      //   ⓪ 低分数据条数 > 正确数据条数                    → 模式2（9.3.0 新增，优先于"高分够多就通过"）
+      //   ① 高分数据够多：得分 ≥ highScoreThreshold 的条数 ≥ highScoreMinCount
       //   ② 或 前人已判定：777 / 601 各自 ≥ 门槛（9.1.8：小合集 ≥2，大合集 ≥4）
-      const smallColl = stats.total > 0 && stats.total <= CONFIG.smallCollectionMaxRows;
+      //   都不满足 → 模式2
+      // 注意：得分 = 0 / 读不到的行走（还没刷新出来）不计入以上任何一项。
+      const smallColl = stats.valid > 0 && stats.valid <= CONFIG.smallCollectionMaxRows;
       const codeNeed = smallColl ? CONFIG.correctCodeMinCountSmall : CONFIG.correctCodeMinCount;
       const hitCodes = CONFIG.judgeCodes.filter((c) => (stats.judgeCounts[c] || 0) >= codeNeed);
       const highHit = stats.scoreHigh >= CONFIG.highScoreMinCount;
+      const lowWins = stats.scoreLow > stats.correct;      // 9.3.0：低分多于正确数据 → 判错
       const head = (similar ? '两列相似' : '两列不相似') + '、匹配分 ' +
         (score === null ? '读不到' : score) + '（' + expandKind + '），展开后：' +
-        judgeText + ' / 得分>' + CONFIG.highScoreThreshold + ' ' + stats.scoreHigh + ' 条' +
-        ' / 共 ' + stats.total + ' 条' + (smallColl ? ('（小合集，码门槛 ' + codeNeed + '）') : '');
+        judgeText + ' / 得分≥' + CONFIG.highScoreThreshold + ' ' + stats.scoreHigh + ' 条' +
+        ' / 低分<' + CONFIG.lowScoreThreshold + ' ' + stats.scoreLow + ' 条' +
+        ' / 正确数据 ' + stats.correct + ' 条' +
+        ' / 有效 ' + stats.valid + ' 条' +
+        (stats.notReady > 0 ? ('（' + stats.notReady + ' 条 0分/读不到未计入）') : '') +
+        (smallColl ? ('（小合集，码门槛 ' + codeNeed + '）') : '');
       const hit = highHit || hitCodes.length > 0;
-      if (hit) {
+      if (lowWins) {
+        mode = 2;
+        reason = head + ' → 低分(<' + CONFIG.lowScoreThreshold + ') ' + stats.scoreLow +
+          ' 条 > 正确数据 ' + stats.correct + ' 条 → 全错';
+      } else if (hit) {
         mode = 1;
         reason = head + ' → ' + (highHit
-          ? ('得分>' + CONFIG.highScoreThreshold + ' 的条数 ' + stats.scoreHigh + ' ≥ ' + CONFIG.highScoreMinCount)
+          ? ('得分≥' + CONFIG.highScoreThreshold + ' 的条数 ' + stats.scoreHigh + ' ≥ ' + CONFIG.highScoreMinCount)
           : ('状态码 ' + hitCodes.join('/') + ' 各自 ≥ ' + codeNeed + ' 条')) +
           ' → 判该合集正确';
       } else {
         mode = 2;
-        reason = head + ' → 得分>' + CONFIG.highScoreThreshold + ' 不足 ' + CONFIG.highScoreMinCount +
+        reason = head + ' → 得分≥' + CONFIG.highScoreThreshold + ' 不足 ' + CONFIG.highScoreMinCount +
           ' 条，且没有判定码 ≥ ' + codeNeed + ' 条 → 全错';
       }
       log('===== 补充判定模式' + mode + '：' + reason + ' =====');
       setStatus('模式' + mode + '：' + reason);
       if (mode === 1) {
+        if (CONFIG.dryRun) return dryRunResult(1, reason);   // 9.3.0 预演：只判定不点击
         log('模式1 → 已展开，直接全剧审核（不勾选、不判错）');
         const r = await doFullReview(R, meta, null, expandedRow);
         return { result: r, mode: 1, reason: reason };
       }
     }
+
+    // ---- 9.3.0 预演模式：判定已出结果 → 直接返回，不点任何按钮 ----
+    if (CONFIG.dryRun) return dryRunResult(mode || 2, reason);
 
     // ---- 模式2：全选 + 批量错误（等全部594）+ 全剧审核 ----
     // 注意：无论当前子样本是什么状态（哪怕没有 0），都必须执行"全选 + 批量错误"，不能跳过判错。
@@ -1252,6 +1306,11 @@
   // 所以点「查询」刷新列表再看一眼 —— 默认点两次（CONFIG.endConfirmRounds）。
   // 返回：刷新后出现的可审行对象（说明还没审完，继续审） | null（确认已审完）
   async function confirmReviewFinished(why) {
+    // 9.3.0 预演：不点「查询」，直接结束（否则预演会真的点击页面）
+    if (CONFIG.dryRun) {
+      log('🧪 预演：不点「' + CONFIG.queryBtnText + '」确认，本轮直接结束');
+      return null;
+    }
     const rounds = Math.max(0, CONFIG.endConfirmRounds | 0);
     if (rounds === 0) return null;
 
@@ -1415,10 +1474,16 @@
            (state.giveUpIds.size > 0 ? ('\n其中 ' + state.giveUpIds.size + ' 个多次刷新仍读不到，本轮已放弃，需人工处理') : '') +
            '\n可再点一次「开始运行」重试这些合集')
         : '';
-      setTimeout(() => alert('处理完成！共处理 ' + state.processedCount + ' 个合集\n模式1(直接全剧审核) ' +
-        state.mode1Count + ' 个 / 模式2(全选判错) ' + state.mode2Count + ' 个' +
-        '\n结束确认：已点「' + CONFIG.queryBtnText + '」刷新 ' + CONFIG.endConfirmRounds +
-        ' 次，未再发现未审核行' + skipText + notReadyText), 100);
+      const dr = !!CONFIG.dryRun;
+      const drTitle = dr ? '🧪 预演结束（未执行任何点击）\n' : '';
+      const modeLine = '模式1(' + (dr ? '本应全剧审核' : '直接全剧审核') + ') ' + state.mode1Count +
+        ' 个 / 模式2(' + (dr ? '本应全选判错' : '全选判错') + ') ' + state.mode2Count + ' 个';
+      const endLine = dr
+        ? '\n预演：未执行任何点击（「' + CONFIG.queryBtnText + '」刷新确认已跳过）'
+        : ('\n结束确认：已点「' + CONFIG.queryBtnText + '」刷新 ' + CONFIG.endConfirmRounds +
+           ' 次，未再发现未审核行');
+      setTimeout(() => alert(drTitle + '处理完成！共处理 ' + state.processedCount + ' 个合集\n' +
+        modeLine + endLine + skipText + notReadyText), 100);
     }
   }
 
@@ -1508,6 +1573,10 @@
           <span>转圈消失才点下一步</span>
         </div>
         <div class="form-row">
+          <label class="p9-check"><input type="checkbox" id="dry-run" ${CONFIG.dryRun ? 'checked' : ''}> <b>预演（只判定不点击）</b></label>
+          <span>验证规则用</span>
+        </div>
+        <div class="form-row">
           <label class="p9-check"><input type="checkbox" id="report-log" ${CONFIG.reportEnabled ? 'checked' : ''}> <b>上报判定日志</b></label>
           <span>POST /judge_log</span>
         </div>
@@ -1582,6 +1651,8 @@
       if (strictEl) CONFIG.strictLoading = strictEl.checked;
       const rpEl = document.querySelector('#report-log');
       if (rpEl) CONFIG.reportEnabled = rpEl.checked;
+      const drEl = document.querySelector('#dry-run');
+      if (drEl) CONFIG.dryRun = drEl.checked;      // 9.3.0：预演（只判定不点击）
       startRun();
     });
     document.querySelector('#stop-btn').addEventListener('click', stopRun);
@@ -1627,6 +1698,9 @@
     updatePanel();
     setStatus('启动中...');
     log('===== 开始运行（从第' + CONFIG.startRow + '行起）=====');
+    log('运行模式：' + (CONFIG.dryRun
+      ? '🧪 预演（只走判定与上报，不点任何按钮；结果见面板日志与 judge_log）'
+      : '正式（会真实执行 全剧审核 / 批量错误 / 查询刷新）'));
     log('严格等待加载完成：' + (CONFIG.strictLoading ? '开（转圈消失才点下一步）' : '关') +
       '；等待上限 普通' + Math.round(CONFIG.loadingWaitMax / 1000) + 's / 慢合集' +
       Math.round(CONFIG.loadingWaitMaxSlow / 1000) + 's（9.1.9 起展开后加载、点击前/勾选前后闸门、' +
@@ -1644,12 +1718,14 @@
       '）改为双列比对（第4列也有则不判错）｜当前表：' + CONFIG.ultimateKeywords.join('、'));
     log('低分保护：匹配分 < ' + CONFIG.lowScoreFloor + ' → 一律全错，不看状态码 ' +
       CONFIG.judgeCodes.join('/') + (CONFIG.lowScoreFloor > 0 ? '' : '（当前已关闭）'));
-    log('判定（9.1.7：除低分下限外一律展开核对）：' +
+    log('判定（9.3.0）：' +
       '⓪多字终极关键词→全错 ⓪-2单字终极关键词(第4列也没有)→全错 ①关键词仅第3列→全错 ' +
-      '②匹配分<' + CONFIG.lowScoreFloor + '→全错（唯一硬规则，不看子样本） ' +
-      '③其余一律展开核对：得分>' + CONFIG.highScoreThreshold + ' 的条数≥' + CONFIG.highScoreMinCount +
+      '②匹配分<' + CONFIG.lowScoreFloor + '→全错（硬规则，不看子样本） ' +
+      '③其余一律展开核对（得分=0/读不到的条不计入统计）：' +
+      '低分(<' + CONFIG.lowScoreThreshold + ')条数 > 正确数据条数 → 全错（优先）；' +
+      '否则 得分≥' + CONFIG.highScoreThreshold + ' 的条数≥' + CONFIG.highScoreMinCount +
       ' 或 ' + CONFIG.judgeCodes.join('/') + ' 各自≥' + CONFIG.correctCodeMinCount +
-      '（子样本≤' + CONFIG.smallCollectionMaxRows + ' 条的小合集：≥' + CONFIG.correctCodeMinCountSmall +
+      '（有效行≤' + CONFIG.smallCollectionMaxRows + ' 条的小合集：≥' + CONFIG.correctCodeMinCountSmall +
       '）→模式1，都不满足→模式2；相似度与匹配分只写日志、不再决定通过与否');
     log('模式2 收尾：批量错误(594)完成后点击「' + CONFIG.queryBtnText + '」刷新列表，不再点「全剧审核」');
     log('（面板已不再显示判定说明，完整规则见本段日志与源码注释）');
