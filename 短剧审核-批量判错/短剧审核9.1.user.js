@@ -1,13 +1,18 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.1.3
+// @version      9.1.4
 // @description  相似度×匹配分二维判定（所有文本都比对相似度）：相似且>95 → 直接全剧审核；相似且≤95 或 不相似且>95 → 展开按状态码 777 或 601 的条数（任一个>3）判定；不相似且≤95 / 匹配分读不到 → 直接全错；含终极关键词、关键词双列比对、30s/60s重试、永久跳过与严格等待加载
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
 // @grant        GM_setClipboard
 // @run-at       document-end
 // ==/UserScript==
+
+// ============================== 9.1.4 补充 ==============================
+//  【本次】按需求移除面板底部的"判定说明"整块文本（.tip），面板更紧凑；
+//          判定规则本身没有任何变化（规则细节见启动时控制台日志与源码注释）。
+// ==========================================================================
 
 // ============================== 9.1.3 补充 ==============================
 //  【一】相似 且 匹配分 > 95 不再"直接全剧审核"，改为【展开核对】：
@@ -1254,24 +1259,6 @@
         <div class="btn-row">
           <button id="copy-skip-btn" class="btn btn-copy">复制跳过清单</button>
         </div>
-        <div class="tip">
-          <b>9.1 判定（9.1.3：通过都必须展开核对；所有文本都比对相似度）</b>：<br>
-          ⓪ <b>终极关键词</b>（${CONFIG.ultimateKeywords.join('、')}）：第3列命中 → <b>直接全错</b>，不执行后续判定<br>
-          ① 关键词双列比对：第3列命中且第4列也有同一词 → 继续判定；第4列没有 → <b>直接全错</b><br>
-          ② 匹配分读不到 → <b>直接全错</b><br>
-          ③ <b>匹配分 &lt; 低分下限 ${CONFIG.lowScoreFloor}</b> → <b>直接全错</b>（低分保护：不看 ${CONFIG.judgeCodes.join('/')}，<b>不可能通过</b>）<br>
-          ④ <b>相似 且 匹配分 &gt; ${CONFIG.parentScoreThreshold}</b> → <b>展开核对</b>：得分 &gt; ${CONFIG.highScoreThreshold} 的高分明细 <b>≥ ${CONFIG.highScoreMinCount} 条</b>，<b>或</b> ${CONFIG.judgeCodes.join('/')} 各自 ≥ ${CONFIG.correctCodeMinCount} 条 → <b>模式1</b>；都不满足 → <b>模式2</b><br>
-          ⑤ <b>相似 且 匹配分 ≤ ${CONFIG.parentScoreThreshold}</b> → <b>展开核对</b>：${CONFIG.judgeCodes.join('/')} <b>各自 ≥ ${CONFIG.correctCodeMinCount} 条</b> → <b>模式1</b>；都不足 → <b>模式2</b><br>
-          ⑥ <b>不相似 且 匹配分 &gt; ${CONFIG.parentScoreThreshold}</b> → <b>展开核对</b>：同 ⑤ 判据<br>
-          ⑦ <b>不相似 且 匹配分 ≤ ${CONFIG.parentScoreThreshold}</b> → <b>直接全错</b>（仍走全选判错）<br>
-          相似判据：两列<b>连续 ${CONFIG.similarMinSubstr} 字相同</b>，或<b>公共不同字 ≥ ${CONFIG.similarMinCommonChars} 个</b>（计数只看 ${CONFIG.judgeCodes.join(' / ')}，其余状态码不参与）<br>
-          <b>模式2</b> = 展开 + 全选 + 批量错误（等全部 ${CONFIG.wrongCode}）+ <b>点「${CONFIG.queryBtnText}」刷新列表</b>（不再点全剧审核，全错数据会自己移走）<br>
-          <b>模式1</b> = 展开核对通过后，点「全剧审核」通过（不勾选、不判错）<br>
-          <b>安全保护</b>：<b>页面上相邻</b> ${CONFIG.noScoreStopCount} 行匹配分读不到 → <b>自动停止运行</b>（面板「异常行上限」可调，0=关闭）；日志会打印第5列原文便于排查<br>
-          <b>等待/重试</b>：全剧审核是否完成<b>只看第2列合集id</b>（唯一）；等待期间第 ${CONFIG.retryAtSec.join('s / ')}s 各重试点击一次同一按钮（最多3次）；仍无响应 → <b>永久跳过该合集，换下一行继续</b><br>
-          <b>严格等待</b>：每次点击前/展开后/提交后都等 antd 转圈消失；转圈期间不判定完成
-        </div>
-
         <div class="p9-log" id="s9-log"></div>
       </div>
       <div class="p9-mini-status" id="s9-mini-status"></div>
@@ -1301,8 +1288,6 @@
       .btn-start{background:#52c41a;color:#fff;}
       .btn-stop{background:#ff4d4f;color:#fff;}
       .btn-copy{background:#f6ffed;color:#389e0d;border:1px solid #b7eb8f;font-size:12px;}
-      .tip{font-size:11px;color:#999;margin-bottom:8px;line-height:1.7;}
-      .tip b{color:#722ed1;}
       .p9-log{max-height:160px;overflow-y:auto;background:#fafafa;border-radius:4px;padding:5px 7px;font-size:11px;font-family:Consolas,monospace;line-height:1.6;color:#666;word-break:break-all;}
     `;
     document.head.appendChild(css);
@@ -1391,6 +1376,7 @@
       '→展开：' + CONFIG.judgeCodes.join('/') + ' 各自≥' + CONFIG.correctCodeMinCount + '→模式1，否则模式2 ' +
       '⑦不相似且≤' + CONFIG.parentScoreThreshold + '→直接全错');
     log('模式2 收尾：批量错误(594)完成后点击「' + CONFIG.queryBtnText + '」刷新列表，不再点「全剧审核」');
+    log('（面板已不再显示判定说明，完整规则见本段日志与源码注释）');
     // 结构自检：打印第1~2行解析结果，便于发现页面改版
     setTimeout(debugStructure, 1500);
     runLoop();
