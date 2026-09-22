@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.4.2
+// @version      9.4.3
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（关键词双列比对、母本最高分(第5列)<90）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含关键词双列比对（命中词第4列缺任一即全错）、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -39,7 +39,24 @@
 //  【预演模式】面板勾选「预演（只判定不点击）」→ 判定链与上报照跑，但不点任何按钮（9.3.0；9.4.2 起
 //      预演读完统计会把自己展开的合集收起，避免子表行留在 DOM 里），
 //      用于改规则后先在真实页面空跑核对结果。
+//  【9.4.3 修复（代码审查发现）】
+//      ① 上报上下文串台：进入 processOneCollection 先清空 state.lastJudge —— 否则"第0步
+//         （上一轮加载未完成）"提前 return 时，会把上一个合集的 childId/关键词写进这一条的日志；
+//      ② 判定码与"正确数据"口径不一致：777/601 行即使分数没刷新也计入"正确数据"
+//         （原来会出现"码已够 4 条 但 correct=0"被低分规则误判全错的自相矛盾）；
+//      ③ 全选兜底：selectAllChildRows 改为返回"实际处于勾选状态的行数"，避免"这些行本来就勾着"
+//         时返回 0 被当成"勾选失败"而把合集永久跳过；
+//      ④ 确认弹窗：等转圈期间弹窗可能已关闭/被重渲染 —— 点击前重新确认按钮仍在，并返回真实点击结果
+//         （原来无论点没点到都当成功，会白等一轮再把这合集当异常跳过）；
+//      ⑤ 展开区节点失效：waitAllJudged 每轮用 resolveExpandedRow() 重新定位展开行（React 重渲染后）；
+//      ⑥ 子表分页预警：子表若带分页，"全选"可能只勾当前页 → 模式2 永远等不到全部 594，现会提示；
+//      ⑦ 母本行过滤自检：过滤后为 0 行会明确报错，避免静默空跑；
+//      ⑧ 「复制跳过清单」补上"还没刷新好（母本最高分读不到）"的合集明细；
+//      ⑨ 全剧审核/查询刷新的完成判定改为"按合集 id 是否还在列表里"（原来只看 workIndex 那一格，
+//         列表重排后那一格会换成别的合集 → 把这个合集误判成已完成而漏掉）；
+//      ⑩ 判定日志上报遇到非 2xx 也进冷却（原来只有网络错误才冷却，后端报 404/500 时会刷屏）。
 //  【版本号提醒】文件内部版本见上方 @version；历史文件「短剧审核9.0」也用过内部号 9.2.0，勿混淆。
+//  注意：9.4.2 那版的上报字段 version 漏改，日志里显示的是 9.4.1（9.4.3 起已跟随版本）。
 //  规则拆解：docs/短剧审核9.1判定机制详解.md ｜ 逐版本变更史：docs/版本演进记录.md
 //  注：9.2.2 仅把原先堆在这里的 164 行逐版变更记录并入上述文档，脚本代码未改动。
 // ==========================================================================
@@ -339,10 +356,17 @@
       await waitLoadingDone('确认弹窗就绪',
         state.curSlow ? CONFIG.confirmReadyWaitMaxSlow : CONFIG.confirmReadyWaitMax);
     }
+    // 9.4.3：等转圈的这段时间里弹窗可能已自动关闭 / 被 React 换掉 →
+    //   必须重新确认按钮还在，并且真的点到了（否则会把"没点到"当成"已提交"，
+    //   后面白等一轮 594 或等合集移走，最后把这个合集误判为异常跳过）
+    if (!confirmBtn.isConnected) {
+      console.warn('[按钮] 确认按钮在等待期间已失效（弹窗关闭或重渲染）→ 视为未提交');
+      return false;
+    }
     confirmBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-    safeClick(confirmBtn);
+    const clicked = safeClick(confirmBtn);
     confirmBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-    return true;
+    return clicked;
   }
 
   // ========== 行信息 ==========
@@ -531,13 +555,16 @@
       const isJudgeCode = CONFIG.judgeCodes.includes(code);
       if (isJudgeCode) judgeCounts[code] = (judgeCounts[code] || 0) + 1;
 
-      if (notReadyRow) { notReady++; return; }         // 该行不再参与 base/低分/高分/正确数据
+      // 9.4.3：判定码(777/601)是"前人已判定"的证据，与得分有没有刷新无关 →
+      //   无论该行分数是否可读，都计入"正确数据"。
+      //   （否则会出现自相矛盾：judgeCounts 里 777 已够 4 条，但 correct=0，被低分规则判全错）
+      const isHigh = !notReadyRow && sc >= CONFIG.highScoreThreshold;
+      if (isJudgeCode || isHigh) correct++;
+      if (notReadyRow) { notReady++; return; }         // 分数相关统计（有效行/低分/高分）不含该行
 
       scoreKnown++;
-      const isHigh = sc >= CONFIG.highScoreThreshold;
       if (isHigh) scoreHigh++;
       else if (sc < CONFIG.lowScoreThreshold) scoreLow++;
-      if (isJudgeCode || isHigh) correct++;
     });
     const detail = Object.keys(counters)
       .map((k) => (k === '' ? '(空)' : k) + '×' + counters[k])
@@ -584,17 +611,22 @@
     }
 
     // 兜底：逐行勾选
-    let count = 0;
     for (const row of rows) {
       if (!state.running) break;
       const cb = row.querySelector(SELECTORS.childCheckbox);
       if (cb && !cb.checked) {
         safeClick(cb);
-        count++;
         await delay(30);
       }
     }
-    return count;
+    // 9.4.3：返回"实际处于勾选状态的行数"，而不是"点了几次" ——
+    //   否则在"这些行本来就是勾选状态"时返回 0，调用方会误判成"勾选失败"而把合集永久跳过
+    let checkedNow = 0;
+    rows.forEach((row) => {
+      const cb = row.querySelector(SELECTORS.childCheckbox);
+      if (cb && cb.checked) checkedNow++;
+    });
+    return checkedNow;
   }
 
   // ========== 展开/收起合集 ==========
@@ -629,7 +661,6 @@
     throw new Error('子表格加载超时(' + Math.round(timeout / 1000) + 's)');
   }
 
-  // 收起合集：若当前已展开则再点一次展开按钮
   // ========== 9.4.2：只取"母本行" ==========
   // 母本行与子样本行的 class 都是 tr.ant-table-row.ant-table-row-level-0（antd 的 level 是"表内层级"，
   // 子表自己也是 level-0），所以直接 document.querySelectorAll(SELECTORS.parentRow) 会把
@@ -637,17 +668,57 @@
   // 短剧名是纯数字（其实是子样本状态码），而且一行一行慢慢跳（每行还要等重读）。
   // 这里统一过滤：① 落在 tr.ant-table-expanded-row 里的行不要；② 嵌在另一个表格里的行不要。
   function isChildTableRow(r) {
-    if (r.closest('tr.ant-table-expanded-row')) return true;      // 展开区里的子表行
+    // ① 落在某个展开区（tr.ant-table-expanded-row）里的行 → 子表行
+    if (r.closest('tr.ant-table-expanded-row')) return true;
+    // ② 本行所属的表格容器位于另一个表格的单元格(td)里 → 也是子表
+    //    （比"祖先里存在另一个表格"更精确：放在卡片/容器里的主表不会被误判掉）
     const tbl = r.closest('.ant-pro-table, .ant-table-wrapper');
-    const outer = tbl && tbl.parentElement && tbl.parentElement.closest('.ant-pro-table, .ant-table-wrapper');
-    return !!outer;                                              // 嵌在另一个表格里 → 也是子表
+    if (!tbl) return false;
+    const td = tbl.closest('td');
+    return !!(td && td.closest('table'));
   }
 
   // 取全部母本行（保持 DOM 顺序）
+  let parentFilterWarned = false;
   function getParentRows() {
-    return Array.from(qsa(document, SELECTORS.parentRow)).filter((r) => !isChildTableRow(r));
+    const all = Array.from(qsa(document, SELECTORS.parentRow));
+    const rows = all.filter((r) => !isChildTableRow(r));
+    // 9.4.3：万一过滤把母本行全筛没了（页面结构变化），必须吵醒使用者 ——
+    //   否则脚本会"扫不到任何合集"而静默空跑一轮
+    if (rows.length === 0 && all.length > 0 && !parentFilterWarned) {
+      parentFilterWarned = true;
+      log('⛔ 母本行过滤后为 0（页面原始 ' + all.length + ' 行）→ isChildTableRow() 可能误判，' +
+        '本轮将扫不到任何合集；请把这条日志反馈给维护者');
+    }
+    return rows;
   }
 
+  // ========== 9.4.3：展开区定位与"子表分页"预警 ==========
+  // React 重渲染后，之前抓到的展开行节点可能已失效（isConnected=false / 里面查不到子表行）。
+  // 这时按"母本行 → 下一个 tr.ant-table-expanded-row"重新定位一次；找不到就退回原缓存。
+  function resolveExpandedRow(parentRow, cached) {
+    if (cached && cached.isConnected && getChildRows(cached).length > 0) return cached;
+    let sib = parentRow ? parentRow.nextElementSibling : null;
+    while (sib && !sib.classList.contains('ant-table-expanded-row')) sib = sib.nextElementSibling;
+    if (sib) {
+      if (cached && sib !== cached) log('↻ 展开区节点已变化 → 已重新定位（继续等待判错完成）');
+      return sib;
+    }
+    return cached;
+  }
+
+  // 子表带分页时，"表头全选"通常只覆盖当前页 → 模式2 可能永远等不到"全部子样本 = 594"。
+  // 这里只做预警（不改变流程），方便定位"点了批量错误却一直等不到 594"的原因。
+  function warnIfChildPaginated(expandedRow) {
+    if (!expandedRow) return;
+    const items = expandedRow.querySelectorAll('.ant-pagination .ant-pagination-item');
+    if (items.length > 1) {
+      log('⚠️ 子表带分页（分页器有 ' + items.length + ' 个页码）→「全选」可能只勾到当前页；' +
+        '如果模式2 总是等不到"全部 594"，请检查这里');
+    }
+  }
+
+  // 收起合集：若当前已展开则再点一次展开按钮
   async function collapseRow(parentRow) {
     const expandBtn = parentRow.querySelector(SELECTORS.expandIcon);
     if (!expandBtn) return;
@@ -773,6 +844,7 @@
     while (Date.now() - start < timeout) {
       if (!state.running) return false;
 
+      expandedRow = resolveExpandedRow(R, expandedRow);   // 9.4.3：节点失效则重新定位
       const stats = getCodeStats(expandedRow);
       const loading = isLoading();
       state.judgeNeed = stats.total;
@@ -790,9 +862,9 @@
   }
 
   // ========== 全剧审核后等待系统完成 ==========
-  // 完成标志（8.0：只用第2列合集id判断，不再用文本兜底）：
-  //   当前工作行的合集id 已不是刚处理的那个（说明该合集已被移走）
-  //   或该行状态变为已审核 / 行消失；
+  // 完成标志（9.4.3：只看第2列合集id，不再依赖 workIndex 下标）：
+  //   ① 这个合集 id 已不在列表里（被移走）；或
+  //   ② 它还在列表里、但状态已变成「已审核」
   // 并且要求页面无转圈（点「全剧审核」后会出现转圈，转圈结束才算系统处理完）
   // 等待期间第 30s / 60s 会各重试点击一次「全剧审核」
   async function waitReviewCompleted(meta, R, expandedRow, timeout, btnText, clickFn) {
@@ -802,16 +874,20 @@
       if (!state.running) return 'stopped';
 
       const rows = getParentRows();                     // 9.4.2：只数母本行
-      const cur = rows[state.workIndex];
       const loading = isLoading();
       if (loading) setStatus('全剧审核处理中（系统转圈中…）');
 
       if (!loading) {
-        if (!cur) return 'done';                      // 行没了 → 处理完成
-        if (getRowStatus(cur).includes('已审核')) return 'done'; // 该位置已是已审核合集
-        const curMeta = getCollectionMeta(cur);
-        // 8.0：严格用第2列id比较（id唯一）；id读不到时不用文本兜底，交给外层判为异常
-        if (curMeta.id && curMeta.id !== meta.id) return 'next';
+        // 9.4.3：用"这个合集 id 还在不在列表里"判断完成，而不是只看 workIndex 那一格 ——
+        //   列表刷新/重排（已审核的会沉到下面）后，原下标可能已经换成别的合集，
+        //   只看那一格会把这个合集误判成"已完成"，从而漏掉它
+        let mine = null;
+        for (const r of rows) {
+          const m = getCollectionMeta(r);
+          if (m.id && m.id === meta.id) { mine = r; break; }
+        }
+        if (!mine) return 'done';                                  // 已从列表移走 → 完成
+        if (getRowStatus(mine).includes('已审核')) return 'done';   // 仍在列表但状态已变「已审核」→ 完成
       }
 
       const waitBtn = btnText || '全剧审核';
@@ -917,7 +993,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.1',
-      version: '9.4.1',
+      version: '9.4.3',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -987,7 +1063,11 @@
             log('✅ 判定日志已上报后端（查看：' + CONFIG.backendBase + '/judge_log/view）');
           }
         } else {
-          log('⚠️ 判定日志上报失败（HTTP ' + r.status + '），丢弃 ' + batch.length + ' 条');
+          // 9.4.3：非 2xx 也进冷却 —— 否则后端一直报 4xx/5xx 时，每批都会往面板日志刷一行
+          reportCooldownUntil = Date.now() + CONFIG.reportRetryCooldownMs;
+          log('⚠️ 判定日志上报失败（HTTP ' + r.status + '），丢弃 ' + batch.length +
+            ' 条并暂停上报 ' + Math.round(CONFIG.reportRetryCooldownMs / 1000) + 's' +
+            (r.status === 404 ? '（404：后端可能是旧版或缺 /judge_log 路由，请重启后端）' : ''));
         }
         if (reportQueue.length) setTimeout(flushReports, 300);
       },
@@ -1019,17 +1099,24 @@
   // ========== 处理单个合集（9.1.3 判定：相似度 × 母本最高分 + 母本最低线 + 展开核对） ==========
   // 模式1（通过）：一律"展开核对后"才可能通过（点「全剧审核」；不勾选、不判错）
   // 模式2（全错）：展开 + 全选 + 批量错误（等全部594）→ 点「查询」刷新列表（不再点全剧审核）
-  // 判定优先级（9.1.3）：
-  //   ① 关键词：第3列命中的任一个词在第4列没有          → 模式2（9.4.0：取消终极关键词，全部走双列比对）
-  //   ① 关键词双列比对：第3列命中且第4列无同词      → 模式2
-  //   ② 母本最高分 < 母本最低线(lowScoreFloor)             → 模式2（唯一保留的硬规则：不看子样本）
-  //   ③ 其余一切情况（相似/不相似、母本最高分高/低/读不到）→ 展开核对（9.1.7 统一判据）：
-  //        得分 > highScoreThreshold 的条数 ≥ highScoreMinCount  → 模式1
-  //        或 777/601 各自 ≥ correctCodeMinCount                  → 模式1
-  //        都不满足                                               → 模式2（全错）
+  // 判定优先级（9.4.x）：
+  //   ① 关键词双列比对：第3列命中的词里，有任一个第4列没有 → 模式2（9.4.0 起取消终极关键词）
+  //   ② 母本最高分(第5列) < 母本最低线(lowScoreFloor=90)   → 模式2（唯一不看子样本的硬规则）
+  //   ③ 其余一切情况（相似/不相似、母本最高分高/低/读不到）→ 展开核对：
+  //        低分(<lowScoreThreshold) 条数 > 正确数据条数             → 模式2（优先）
+  //        否则 得分≥highScoreThreshold 的条数 ≥ highScoreMinCount  → 模式1
+  //        或   777/601 各自 ≥ 门槛（有效行≤30 ≥2；>30 ≥4）        → 模式1
+  //        都不满足                                                → 模式2（全错）
+  //   （得分=0/读不到的行走不计入以上统计；正确数据 = 777/601 或 得分≥93，按行去重）
   // 相似度判据（所有文本都比对）：连续 similarMinSubstr 字相同 或 公共不同字 ≥ similarMinCommonChars
-  // 返回 { result: 'ok'|'problem', mode: 1|2, reason }
+  // 返回 { result: 'ok'|'problem', mode: 0|1|2, reason }
   async function processOneCollection(R, meta) {
+    // 9.4.3：先把上报上下文清空 —— 否则"第0步"提前 return（上一轮加载未完成）时，
+    //   会把【上一个合集】的 childId/关键词等当成这一条的写进判定日志
+    state.lastJudge = {
+      childId: '', childRowText: '', similar: false, simDetail: '',
+      kw: '', dual: false, ultimate: '', matchMode: '', counts: null,
+    };
     // 9.1.9：登记本合集是否慢处理 → 所有「等待加载完成」闸门统一由 loadWaitMax() 取值
     state.curSlow = !!meta.isSlow;
     const expandWait = meta.isSlow ? CONFIG.expandWaitMaxSlow : CONFIG.expandWaitMax;
@@ -1114,6 +1201,7 @@
     }
 
     const stats = getCodeStats(expandedRow);
+    warnIfChildPaginated(expandedRow);          // 9.4.3：子表分页预警（只提示，不改流程）
 
     // 9.1.5：子样本第一条 id（子样本第2列）+ 第一条整行文本 + 统计数字 → 供上报
     if (state.lastJudge) {
@@ -1521,10 +1609,22 @@
 
   // 跳过清单文本（供「复制跳过清单」）
   function buildSkipText() {
-    if (!state.skipList || state.skipList.length === 0) return '（本轮没有跳过的合集）';
-    const lines = ['# 跳过合集清单（需人工处理）  共 ' + state.skipList.length + ' 个',
-      '# 合集id\t短剧名\t跳过原因\t时间'];
-    state.skipList.forEach((s) => lines.push([s.id, s.name, s.reason, s.time].join('\t')));
+    const lines = [];
+    // 9.4.3：即使没有异常跳过，也要能把"还没刷新好"的合集带走（否则这份剪贴板清单会漏掉它们）
+    if (!state.skipList || state.skipList.length === 0) {
+      lines.push('# 跳过合集清单（需人工处理）：本轮没有异常跳过的合集');
+    } else {
+      lines.push('# 跳过合集清单（需人工处理）  共 ' + state.skipList.length + ' 个');
+      lines.push('# 合集id\t短剧名\t跳过原因\t时间');
+      state.skipList.forEach((s) => lines.push([s.id, s.name, s.reason, s.time].join('\t')));
+    }
+    if (state.notReadyList && state.notReadyList.length > 0) {
+      lines.push('');
+      lines.push('# 还没刷新好（母本最高分读不到）  共 ' + state.notReadyList.length + ' 个');
+      lines.push('# 合集id\t短剧名\t第5列原文\t尝试次数\t时间');
+      state.notReadyList.forEach((s) => lines.push(
+        [s.id, s.name, s.raw || '(空)', s.tries || 1, s.time].join('\t')));
+    }
     return lines.join('\n');
   }
 
@@ -1702,6 +1802,7 @@
     state.notReadyList = [];
     state.notReadyTries = new Map();
     state.giveUpIds = new Set();
+    parentFilterWarned = false;   // 9.4.3：每轮重置"母本行过滤异常"提示
     state.doneIds = new Set();
     state.lastJudge = null;
     state.curSlow = false;      // 9.1.9：本轮开始前重置"慢处理"档位
@@ -1736,7 +1837,7 @@
     log('母本最低线：母本最高分(第5列) < ' + CONFIG.lowScoreFloor +
       ' → 一律全错（90 分是底线，即使 777/601 够多也不救），当前状态码 ' +
       CONFIG.judgeCodes.join('/') + (CONFIG.lowScoreFloor > 0 ? '' : '（当前最低线已设为 0 = 关闭）'));
-    log('判定（9.4.1）：' +
+    log('判定（9.4.3）：' +
       '①关键词：第3列命中的词第4列缺任一个→全错（已取消终极关键词） ' +
       '②母本最高分<' + CONFIG.lowScoreFloor + '→全错（硬规则，不看子样本） ' +
       '③其余一律展开核对（得分=0/读不到的条不计入统计）：' +
