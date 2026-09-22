@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.1.6
+// @version      9.1.7
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；相似度×匹配分二维判定（所有文本都比对相似度）：相似且>95 → 直接全剧审核；相似且≤95 或 不相似且>95 → 展开按状态码 777 或 601 的条数（任一个>3）判定；不相似且≤95 / 匹配分读不到 → 直接全错；含终极关键词、关键词双列比对、30s/60s重试、永久跳过与严格等待加载
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -11,6 +11,19 @@
 // @connect      localhost
 // @run-at       document-end
 // ==/UserScript==
+
+// ============================== 9.1.7 进一步降低"误判全错" ==============================
+//  【背景】最怕的是"该对的被判全错"。原规则里有两条特别容易误杀：
+//        ① 不相似 且 匹配分 ≤95 → 直接全错（连展开都不展开，看不到子样本里的大量高分数据）
+//        ② 匹配分读不到        → 直接全错
+//  【本次】这两条都改成【展开核对】；现在只有"匹配分 < 低分下限(90)"这一条硬规则会直接全错。
+//  【展开核对统一判据】满足任一 → 模式1（全剧审核）：
+//        · 子样本得分(第8列) > 95 的条数 ≥ 4            （大量高分数据 = 该合集质量好）
+//        · 或 状态码 777 ≥ 4 条 ／ 601 ≥ 4 条（各自计）  （前人已判定）
+//        都不满足 → 模式2（全错）
+//  【说明】相似度与匹配分从此不再决定"通过与否"，只写进判定日志/理由，便于事后分析。
+//          想调整松紧只改 CONFIG：highScoreThreshold / highScoreMinCount / correctCodeMinCount / lowScoreFloor
+// ==========================================================================
 
 // ============================== 9.1.6 修复：单字终极关键词误杀 ==============================
 //  【问题】终极关键词里有单字「画」，规则是"第3列命中 → 直接全错，不执行任何后续判定"。
@@ -977,13 +990,14 @@
   // 模式1（通过）：一律"展开核对后"才可能通过（点「全剧审核」；不勾选、不判错）
   // 模式2（全错）：展开 + 全选 + 批量错误（等全部594）→ 点「查询」刷新列表（不再点全剧审核）
   // 判定优先级（9.1.3）：
-  //   ⓪ 终极关键词命中第3列                        → 模式2（不执行后续判定）
+  //   ⓪ 多字终极关键词命中第3列                    → 模式2（不执行后续判定）
+  //   ⓪-2 单字终极关键词（第4列也没有）              → 模式2
   //   ① 关键词双列比对：第3列命中且第4列无同词      → 模式2
-  //   ② 匹配分读不到                                → 模式2（直接全错）
-  //   ③ 匹配分 < 低分下限(lowScoreFloor)             → 模式2（直接全错，不看 777/601，绝不可能通过）
-  //   ④ 相似 且 匹配分 > 95                         → 展开核对：高分明细(得分>95) ≥ 4 条，或 777/601 各自 ≥ 4 条 → 模式1；否则模式2
-  //   ⑤ 不相似 且 匹配分 ≤ 95                       → 模式2（直接全错）
-  //   ⑥ 相似且 ≤95 ／ 不相似且 >95                   → 展开核对：777/601 各自 ≥ 4 条 → 模式1；否则模式2
+  //   ② 匹配分 < 低分下限(lowScoreFloor)             → 模式2（唯一保留的硬规则：不看子样本）
+  //   ③ 其余一切情况（相似/不相似、匹配分高/低/读不到）→ 展开核对（9.1.7 统一判据）：
+  //        得分 > highScoreThreshold 的条数 ≥ highScoreMinCount  → 模式1
+  //        或 777/601 各自 ≥ correctCodeMinCount                  → 模式1
+  //        都不满足                                               → 模式2（全错）
   // 相似度判据（所有文本都比对）：连续 similarMinSubstr 字相同 或 公共不同字 ≥ similarMinCommonChars
   // 返回 { result: 'ok'|'problem', mode: 1|2, reason }
   async function processOneCollection(R, meta) {
@@ -1025,48 +1039,35 @@
     let needExpand = false, expandKind = '', expandReason = '';
 
     if (ultimateKw) {
-      // ⓪ 多字终极关键词：第3列命中 → 直接全错，不看相似度/匹配分
+      // ⓪ 多字终极关键词：第3列命中 → 直接全错，不看子样本
       mode = 2;
       reason = '【终极关键词】「' + ultimateKw + '」出现在第3列 → 直接全错（不执行后续判定）';
     } else if (singleUlt && !(meta.originalName || '').includes(singleUlt)) {
-      // ⓪-2 单字终极关键词（9.1.6）：只有"第4列也没有这个字"时才全错；
-      //      第4列也有 → 不直接判错，继续走相似度/匹配分/777 的正常判定
+      // ⓪-2 单字终极关键词（9.1.6）：只有"第4列也没有这个字"时才全错
       mode = 2;
       reason = '单字终极关键词「' + singleUlt + '」只出现在第3列（第4列没有该字）→ 直接全错';
     } else if (kwr.hit) {
       // ① 第3列命中普通关键词、第4列没有 → 直接全错
       mode = 2;
       reason = '关键词「' + kwr.kw + '」仅出现在第3列（第4列无该词）→ 直接全错';
-    } else if (score === null) {
-      // ② 匹配分读不到 → 直接全错
+    } else if (score !== null && CONFIG.lowScoreFloor > 0 && score < CONFIG.lowScoreFloor) {
+      // ② 低分保护（9.1.7：唯一保留的"不看子样本"硬规则）
       mode = 2;
-      reason = '匹配分读取失败 → 直接全错' + (kwr.dual ? '（关键词两列都有）' : '');
-    } else if (CONFIG.lowScoreFloor > 0 && score < CONFIG.lowScoreFloor) {
-      // ③ 低分保护：匹配分 < 下限 → 一律全错（不看状态码，绝不可能通过）
-      mode = 2;
-      reason = '匹配分 ' + score + ' < 低分下限 ' + CONFIG.lowScoreFloor + ' → 一律全错（不看状态码 ' +
-        CONFIG.judgeCodes.join('/') + '，不可能通过）' + (kwr.dual ? '（关键词两列都有）' : '');
-    } else if (similar && score > CONFIG.parentScoreThreshold) {
-      // ④ 相似 且 匹配分 > 95 → 9.1.3 起也要展开核对（高分明细 ≥4 条，或 777/601 各自 ≥4 条）
+      reason = '匹配分 ' + score + ' < 低分下限 ' + CONFIG.lowScoreFloor +
+        ' → 直接全错（低分保护，不看子样本）' + (kwr.dual ? '（关键词两列都有）' : '');
+    } else {
+      // ③ 其余一切情况都展开核对（9.1.7）：
+      //     相似/不相似、匹配分高/低/读不到 都不再直接判错，改由"子样本质量"决定
       needExpand = true;
-      expandKind = 'high';
-      expandReason = '两列相似 且 匹配分 ' + score + ' > ' + CONFIG.parentScoreThreshold +
-        ' → 展开核对：子样本得分 > ' + CONFIG.highScoreThreshold + ' 的条数 ≥ ' + CONFIG.highScoreMinCount +
+      expandKind = (score === null)
+        ? 'no-score'
+        : (similar
+            ? (score > CONFIG.parentScoreThreshold ? 'similar-high' : 'similar')
+            : (score > CONFIG.parentScoreThreshold ? 'dissimilar-high' : 'dissimilar'));
+      expandReason = '相似=' + (similar ? '是' : '否') + '、匹配分=' + (score === null ? '读不到' : score) +
+        ' → 展开核对：得分 > ' + CONFIG.highScoreThreshold + ' 的条数 ≥ ' + CONFIG.highScoreMinCount +
         ' 条，或状态码 ' + CONFIG.judgeCodes.join('/') + ' 各自 ≥ ' + CONFIG.correctCodeMinCount +
         ' 条 → 模式1；都不满足 → 模式2';
-    } else if (!similar && score <= CONFIG.parentScoreThreshold) {
-      // ⑤ 不相似 且 匹配分 ≤ 95 → 直接全错（全错流程本身仍需展开去全选子样本）
-      mode = 2;
-      reason = '两列不相似 且 匹配分 ' + score + ' ≤ ' + CONFIG.parentScoreThreshold +
-        ' → 直接全错（不数 777/601，直接进全错流程）';
-    } else {
-      // ⑥ 相似但 ≤95 ／ 不相似但 >95 → 展开核对 777/601
-      needExpand = true;
-      expandKind = 'codes';
-      expandReason = (similar ? '两列相似' : '两列不相似') + ' 且 匹配分 ' + score +
-        (similar ? ' ≤ ' : ' > ') + CONFIG.parentScoreThreshold +
-        ' → 展开核对：状态码 ' + CONFIG.judgeCodes.join('/') + ' 各自 ≥ ' + CONFIG.correctCodeMinCount +
-        ' 条 → 模式1；都不足 → 模式2';
     }
 
     if (!needExpand) {
@@ -1111,26 +1112,26 @@
 
     // ---- 待定 → 按展开核对结果判定 ----
     if (needExpand) {
+      // 9.1.7：展开核对统一判据（所有分支同一套）
+      //   ① 高分数据够多：得分 > highScoreThreshold 的条数 ≥ highScoreMinCount
+      //   ② 或 前辈已判定：777 / 601 各自 ≥ correctCodeMinCount
       const hitCodes = CONFIG.judgeCodes.filter((c) => (stats.judgeCounts[c] || 0) >= CONFIG.correctCodeMinCount);
       const highHit = stats.scoreHigh >= CONFIG.highScoreMinCount;
-      const head = (similar ? '两列相似' : '两列不相似') + ' 且 匹配分 ' + score + '，展开后：' +
-        judgeText + ' / 得分>' + CONFIG.highScoreThreshold + ' ' + stats.scoreHigh + ' 条';
-      // expandKind='high'（相似且>95）：高分明细够 或 777/601 各自够
-      // expandKind='codes'（相似≤95 / 不相似>95）：只看 777/601
-      const highUsed = (expandKind === 'high' && highHit);
-      const hit = highUsed || hitCodes.length > 0;
+      const head = (similar ? '两列相似' : '两列不相似') + '、匹配分 ' +
+        (score === null ? '读不到' : score) + '（' + expandKind + '），展开后：' +
+        judgeText + ' / 得分>' + CONFIG.highScoreThreshold + ' ' + stats.scoreHigh + ' 条' +
+        ' / 共 ' + stats.total + ' 条';
+      const hit = highHit || hitCodes.length > 0;
       if (hit) {
         mode = 1;
-        reason = head + ' → ' + (highUsed
-          ? ('得分>' + CONFIG.highScoreThreshold + ' 的条数 ≥ ' + CONFIG.highScoreMinCount)
+        reason = head + ' → ' + (highHit
+          ? ('得分>' + CONFIG.highScoreThreshold + ' 的条数 ' + stats.scoreHigh + ' ≥ ' + CONFIG.highScoreMinCount)
           : ('状态码 ' + hitCodes.join('/') + ' 各自 ≥ ' + CONFIG.correctCodeMinCount + ' 条')) +
           ' → 判该合集正确';
       } else {
         mode = 2;
-        reason = head + ' → ' + (expandKind === 'high'
-          ? ('得分>' + CONFIG.highScoreThreshold + ' 不足 ' + CONFIG.highScoreMinCount +
-             ' 条，且没有判定码 ≥ ' + CONFIG.correctCodeMinCount + ' 条')
-          : ('没有任何判定码 ≥ ' + CONFIG.correctCodeMinCount + ' 条')) + ' → 全错';
+        reason = head + ' → 得分>' + CONFIG.highScoreThreshold + ' 不足 ' + CONFIG.highScoreMinCount +
+          ' 条，且没有判定码 ≥ ' + CONFIG.correctCodeMinCount + ' 条 → 全错';
       }
       log('===== 补充判定模式' + mode + '：' + reason + ' =====');
       setStatus('模式' + mode + '：' + reason);
@@ -1569,14 +1570,12 @@
       '）改为双列比对（第4列也有则不判错）｜当前表：' + CONFIG.ultimateKeywords.join('、'));
     log('低分保护：匹配分 < ' + CONFIG.lowScoreFloor + ' → 一律全错，不看状态码 ' +
       CONFIG.judgeCodes.join('/') + (CONFIG.lowScoreFloor > 0 ? '' : '（当前已关闭）'));
-    log('判定（9.1.3：通过都必须展开核对）：⓪终极关键词→全错 ' +
-      '①关键词仅第3列→全错 ②匹配分读不到→全错 ' +
-      '③匹配分<' + CONFIG.lowScoreFloor + '→全错（不可能通过） ' +
-      '④相似且匹配分>' + CONFIG.parentScoreThreshold + '→展开：高分(>' + CONFIG.highScoreThreshold + ')≥' +
-      CONFIG.highScoreMinCount + ' 或 ' + CONFIG.judgeCodes.join('/') + ' 各自≥' + CONFIG.correctCodeMinCount + '→模式1，否则模式2 ' +
-      '⑤相似且≤' + CONFIG.parentScoreThreshold + ' ／ ⑥不相似且>' + CONFIG.parentScoreThreshold +
-      '→展开：' + CONFIG.judgeCodes.join('/') + ' 各自≥' + CONFIG.correctCodeMinCount + '→模式1，否则模式2 ' +
-      '⑦不相似且≤' + CONFIG.parentScoreThreshold + '→直接全错');
+    log('判定（9.1.7：除低分下限外一律展开核对）：' +
+      '⓪多字终极关键词→全错 ⓪-2单字终极关键词(第4列也没有)→全错 ①关键词仅第3列→全错 ' +
+      '②匹配分<' + CONFIG.lowScoreFloor + '→全错（唯一硬规则，不看子样本） ' +
+      '③其余一律展开核对：得分>' + CONFIG.highScoreThreshold + ' 的条数≥' + CONFIG.highScoreMinCount +
+      ' 或 ' + CONFIG.judgeCodes.join('/') + ' 各自≥' + CONFIG.correctCodeMinCount + '→模式1，都不满足→模式2；' +
+      '相似度与匹配分只写日志、不再决定通过与否');
     log('模式2 收尾：批量错误(594)完成后点击「' + CONFIG.queryBtnText + '」刷新列表，不再点「全剧审核」');
     log('（面板已不再显示判定说明，完整规则见本段日志与源码注释）');
     log('判定日志上报：' + (CONFIG.reportEnabled
