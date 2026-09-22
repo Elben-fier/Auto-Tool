@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.1】
 // @namespace    https://doubao.com/userscripts
-// @version      9.4.0
-// @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（关键词双列比对、匹配分<低分下限）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含关键词双列比对（命中词第4列缺任一即全错）、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
+// @version      9.4.1
+// @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（关键词双列比对、母本最高分(第5列)<90）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含关键词双列比对（命中词第4列缺任一即全错）、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
 // @grant        GM_setClipboard
@@ -16,19 +16,21 @@
 //  【判定链】硬规则（命中即模式2全错，不看子样本）：
 //      ① 关键词双列比对：第3列命中的关键词，只要有任一个在第4列没有 → 全错
 //         （9.4.0 起取消"终极关键词"，全部关键词都走这条；两列都有则放行继续判定）
-//      ② 匹配分 < lowScoreFloor(默认90)
-//    其余一切情况（相似/不相似、匹配分高低/读不到）→【展开核对】：
+//      ② 母本最高分 < lowScoreFloor(默认90)
+//    其余一切情况（相似/不相似、母本最高分高低/读不到）→【展开核对】：
 //      · 子样本得分 = 0 或读不到的行走 =「还没刷新出来」→ 整行不计入任何统计（9.3.0）
 //      · 低分(<80)条数 > 正确数据条数 → 模式2 全错（9.3.0 新增，优先于"高分够多"）
 //      · 否则 得分≥93 的条数 ≥ 4 或 状态码 777/601 各自达标
 //        （有效行 ≤ 30 条的小合集 ≥ 2；> 30 条的大合集 ≥ 4）→ 模式1（点「全剧审核」）
 //      · 都不满足 → 模式2（全选 + 批量错误 → 等全部 594 → 点页面「查询」刷新列表）
 //    "正确数据" = 判定码 777/601 或 得分≥93（同一行只算一次）。
-//    相似度与匹配分不再决定通过与否，只写进判定日志与判定理由（v9.1.7 起）。
+//    相似度与母本最高分不再决定通过与否，只写进判定日志与判定理由（v9.1.7 起）。
+//  【术语】母本最高分 = 母本第5列 = 子样本单条分的最大值（面板「母本最高分」只影响日志标签，
+//      「母本最低线」=90 分底线：最高分低于它一律全错）；单条分 = 子样本第8列（高分≥93 / 低分<80）。
 //  【扫描与结束】每轮从面板「起始行号」往下扫；「已审核」只作边界（说明下面都已审过）；
 //      第2列 id 读不到的异常行跳过继续看；扫不到可审行时点「查询」刷新确认两次，
 //      确认页面除「已审核」与「已跳过的异常数据」外没有未审核行 → 判定审核结束（v9.2.0）。
-//  【匹配分读不到】先等加载完成并重读 N 次；仍读不到 = "母本还没刷新好" → 本轮跳过该合集、
+//  【母本最高分读不到】先等加载完成并重读 N 次；仍读不到 = "母本还没刷新好" → 本轮跳过该合集、
 //      继续审别的行，刷新列表后自动重试，结束时汇总（不再中断整轮，v9.2.1）。
 //  【稳定性】严格等待加载（转圈闸门）、30s/60s 重试、异常永久跳过、慢处理档位（集数 > 300
 //      时所有等待闸门放宽，v9.1.9）、判定日志上报 POST /judge_log（v9.1.5）。
@@ -46,7 +48,7 @@
 
   // ========== 可配置项 ==========
   const CONFIG = {
-    // —— 模式判定（9.1.0：相似度 × 匹配分 二维判定）——
+    // —— 模式判定（9.1.0：相似度 × 母本最高分 二维判定）——
     parentScoreThreshold: 95,      // 匹配最高分(第5列)：相似 且 > 该值 → 展开核对高分明细（9.1.3）
     highScoreThreshold: 93,        // 【展开核对】子样本得分(第8列) ≥ 该值 视为"高分数据"（9.3.0：95 → 93）
     lowScoreThreshold: 80,         // 9.3.0：子样本得分(第8列) 在 (0, 该值) 之间 视为"低分数据"
@@ -55,13 +57,14 @@
     queryBtnText: '查询',          // 全错处理后的收尾：点击页面「查询」按钮刷新列表（不再点全剧审核）
     endConfirmRounds: 2,           // 9.2.0：扫不到可审行时，点「查询」刷新确认的次数（0=不确认直接结束）
     endConfirmSettleMs: 1500,      // 9.2.0：每次刷新确认后额外的稳定等待(ms)，等列表重排完再重扫
-    lowScoreFloor: 90,             // 【低分保护】匹配分 < 该值 → 一律全错（不看 777/601，不可能通过）；0=关闭
+    lowScoreFloor: 90,             // 【母本最低线】母本最高分(第5列) < 该值 → 一律全错（90 分是底线：
+                                   //   即使子样本 777/601 够多也不救）；0=关闭
     judgeCodes: ['777', '601'],    // 需要展开时统计的子样本状态码（两个码各自计数）
     correctCodeMinCount: 4,        // 【大合集】任一 judgeCode 的条数 ≥ 该值 → 模式1（子样本 > smallCollectionMaxRows 条时用）
     correctCodeMinCountSmall: 2,   // 【小合集】子样本 ≤ smallCollectionMaxRows 条时，门槛降为 ≥ 该值
     smallCollectionMaxRows: 30,    // 小合集的判定边界：子样本条数 ≤ 该值 视为小合集（9.1.8）
-    scoreRetryCount: 3,            // 9.2.1：母本匹配分读不到时，先等加载完成并重读几次；仍读不到才算"还没刷新好"
-    scoreRetryGapMs: 1200,         // 9.2.1：匹配分重读的间隔(ms)
+    scoreRetryCount: 3,            // 9.2.1：母本最高分读不到时，先等加载完成并重读几次；仍读不到才算"还没刷新好"
+    scoreRetryGapMs: 1200,         // 9.2.1：母本最高分重读的间隔(ms)
     scoreSkipWarnCount: 5,         // 9.2.1：本轮"还没刷新好"累计到该条数时，提示检查第5列选择器（只提示，不停止运行）
     scoreGiveUpRounds: 3,          // 9.2.1：同一合集最多尝试几次（每次都是"重读+跳过+等下次刷新"）；超过则本轮彻底放弃并汇总
     wrongCode: '594',              // 判错完成标志（全选+批量错误后，子样本状态码 0 → 594）
@@ -116,10 +119,10 @@
     processedCount: 0,
     mode1Count: 0,       // 直接全剧审核次数
     mode2Count: 0,       // 全选判错次数
-    notReadyIds: new Set(),  // 9.2.1：匹配分读不到 =「母本还没刷新好」的合集id（本轮先跳过，列表刷新后自动重试）
+    notReadyIds: new Set(),  // 9.2.1：母本最高分读不到 =「母本还没刷新好」的合集id（本轮先跳过，列表刷新后自动重试）
     notReadyList: [],        // 9.2.1：明细 {id,name,row,raw,tries,time}，结束时汇总提示
     notReadyTries: new Map(),// 9.2.1：id → 已跳过次数（超过 scoreGiveUpRounds 就本轮彻底放弃，防来回打转）
-    giveUpIds: new Set(),    // 9.2.1：本轮彻底放弃的合集id（匹配分始终读不到，需人工处理）
+    giveUpIds: new Set(),    // 9.2.1：本轮彻底放弃的合集id（母本最高分始终读不到，需人工处理）
     doneIds: new Set(),  // 9.1.3：本轮已成功处理过的合集id（查询后可能仍留在列表里，避免重复处理）
     lastJudge: null,     // 9.1.5：本轮判定的上下文（子样本首条id/相似/关键词/统计），供上报日志用
     workIndex: 0,        // 当前工作行（0=第1行）
@@ -206,7 +209,7 @@
     return state.curSlow ? CONFIG.loadingWaitMaxSlow : CONFIG.loadingWaitMax;
   }
 
-  // ========== 9.2.1：母本匹配分（第5列）读取 ==========
+  // ========== 9.2.1：母本最高分（第5列）读取 ==========
   // 读不到 ≠ 页面改版：多数情况是母本还没刷新好。这里先重读几次，仍读不到就交给上层
   // 按「还没刷新好」处理（本轮先跳过该合集、继续审别的行，刷新列表后自动重试）。
   function readParentScore(R) {
@@ -223,8 +226,8 @@
     const tries = Math.max(0, CONFIG.scoreRetryCount | 0);
     for (let i = 1; i <= tries; i++) {
       if (!state.running) return last;
-      setStatus('等母本匹配分刷新（第 ' + i + '/' + tries + ' 次）...');
-      if (CONFIG.strictLoading && i === 1) await waitLoadingDone('等母本匹配分刷新', loadWaitMax());
+      setStatus('等母本最高分刷新（第 ' + i + '/' + tries + ' 次）...');
+      if (CONFIG.strictLoading && i === 1) await waitLoadingDone('等母本最高分刷新', loadWaitMax());
       await delay(CONFIG.scoreRetryGapMs);
       if (!R || !R.isConnected) {
         last = { score: null, raw: '(行已消失)' };
@@ -232,7 +235,7 @@
       }
       last = readParentScore(R);
       if (last.score !== null) {
-        log('✓ 匹配分已刷新出来：' + last.score + '（重读第 ' + i + ' 次）');
+        log('✓ 母本最高分已刷新出来：' + last.score + '（重读第 ' + i + ' 次）');
         return last;
       }
     }
@@ -826,9 +829,9 @@
     }
     log('点击「' + CONFIG.queryBtnText + '」刷新列表...');
     safeClick(btn);
-    // 9.2.1：列表刷新后，之前"还没刷新好"（匹配分读不到）的合集重新参与扫描
+    // 9.2.1：列表刷新后，之前"还没刷新好"（母本最高分读不到）的合集重新参与扫描
     if (state.notReadyIds.size > 0) {
-      log('↻ 列表已刷新 → 重新尝试之前读不到匹配分的 ' + state.notReadyIds.size + ' 个合集');
+      log('↻ 列表已刷新 → 重新尝试之前读不到母本最高分的 ' + state.notReadyIds.size + ' 个合集');
       state.notReadyIds = new Set();
     }
     return true;
@@ -891,7 +894,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.1',
-      version: '9.4.0',
+      version: '9.4.1',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -990,14 +993,14 @@
     return { result: 'ok', mode: mode, reason: reason + '（预演：未执行任何点击）', dryRun: true };
   }
 
-  // ========== 处理单个合集（9.1.3 判定：相似度 × 匹配分 + 低分保护 + 展开核对） ==========
+  // ========== 处理单个合集（9.1.3 判定：相似度 × 母本最高分 + 母本最低线 + 展开核对） ==========
   // 模式1（通过）：一律"展开核对后"才可能通过（点「全剧审核」；不勾选、不判错）
   // 模式2（全错）：展开 + 全选 + 批量错误（等全部594）→ 点「查询」刷新列表（不再点全剧审核）
   // 判定优先级（9.1.3）：
   //   ① 关键词：第3列命中的任一个词在第4列没有          → 模式2（9.4.0：取消终极关键词，全部走双列比对）
   //   ① 关键词双列比对：第3列命中且第4列无同词      → 模式2
-  //   ② 匹配分 < 低分下限(lowScoreFloor)             → 模式2（唯一保留的硬规则：不看子样本）
-  //   ③ 其余一切情况（相似/不相似、匹配分高/低/读不到）→ 展开核对（9.1.7 统一判据）：
+  //   ② 母本最高分 < 母本最低线(lowScoreFloor)             → 模式2（唯一保留的硬规则：不看子样本）
+  //   ③ 其余一切情况（相似/不相似、母本最高分高/低/读不到）→ 展开核对（9.1.7 统一判据）：
   //        得分 > highScoreThreshold 的条数 ≥ highScoreMinCount  → 模式1
   //        或 777/601 各自 ≥ correctCodeMinCount                  → 模式1
   //        都不满足                                               → 模式2（全错）
@@ -1048,20 +1051,20 @@
       reason = '关键词「' + kwr.missing.join('、') + '」出现在第3列但第4列没有（命中：' +
         kwr.matched.join('、') + '）→ 直接全错';
     } else if (score !== null && CONFIG.lowScoreFloor > 0 && score < CONFIG.lowScoreFloor) {
-      // ② 低分保护（9.1.7：唯一保留的"不看子样本"硬规则）
+      // ② 母本最低线（9.1.7：唯一保留的"不看子样本"硬规则；90 分是底线，777/601 够多也不救）
       mode = 2;
-      reason = '匹配分 ' + score + ' < 低分下限 ' + CONFIG.lowScoreFloor +
-        ' → 直接全错（低分保护，不看子样本）' + (kwr.dual ? '（关键词两列都有）' : '');
+      reason = '母本最高分 ' + score + ' < 母本最低线 ' + CONFIG.lowScoreFloor +
+        ' → 直接全错（90 分是底线：即使子样本 777/601 够多也不救）' + (kwr.dual ? '（关键词两列都有）' : '');
     } else {
       // ③ 其余一切情况都展开核对（9.1.7）：
-      //     相似/不相似、匹配分高/低/读不到 都不再直接判错，改由"子样本质量"决定
+      //     相似/不相似、母本最高分高/低/读不到 都不再直接判错，改由"子样本质量"决定
       needExpand = true;
       expandKind = (score === null)
         ? 'no-score'
         : (similar
             ? (score > CONFIG.parentScoreThreshold ? 'similar-high' : 'similar')
             : (score > CONFIG.parentScoreThreshold ? 'dissimilar-high' : 'dissimilar'));
-      expandReason = '相似=' + (similar ? '是' : '否') + '、匹配分=' + (score === null ? '读不到' : score) +
+      expandReason = '相似=' + (similar ? '是' : '否') + '、母本最高分=' + (score === null ? '读不到' : score) +
         ' → 展开核对：得分 > ' + CONFIG.highScoreThreshold + ' 的条数 ≥ ' + CONFIG.highScoreMinCount +
         ' 条，或状态码 ' + CONFIG.judgeCodes.join('/') + ' 各自 ≥ ' + CONFIG.correctCodeMinCount +
         ' 条（子样本 ≤ ' + CONFIG.smallCollectionMaxRows + ' 条的小合集只要 ≥ ' +
@@ -1124,7 +1127,7 @@
       const hitCodes = CONFIG.judgeCodes.filter((c) => (stats.judgeCounts[c] || 0) >= codeNeed);
       const highHit = stats.scoreHigh >= CONFIG.highScoreMinCount;
       const lowWins = stats.scoreLow > stats.correct;      // 9.3.0：低分多于正确数据 → 判错
-      const head = (similar ? '两列相似' : '两列不相似') + '、匹配分 ' +
+      const head = (similar ? '两列相似' : '两列不相似') + '、母本最高分 ' +
         (score === null ? '读不到' : score) + '（' + expandKind + '），展开后：' +
         judgeText + ' / 得分≥' + CONFIG.highScoreThreshold + ' ' + stats.scoreHigh + ' 条' +
         ' / 低分<' + CONFIG.lowScoreThreshold + ' ' + stats.scoreLow + ' 条' +
@@ -1260,8 +1263,8 @@
         continue;
       }
       if (state.skipIds.has(meta.id)) continue;          // 异常数据（本轮已永久跳过）
-      if (state.notReadyIds.has(meta.id)) continue;      // 9.2.1：匹配分读不到=还没刷新好，本轮先跳过
-      if (state.giveUpIds.has(meta.id)) continue;        // 9.2.1：多次刷新仍读不到匹配分，本轮已放弃
+      if (state.notReadyIds.has(meta.id)) continue;      // 9.2.1：母本最高分读不到=还没刷新好，本轮先跳过
+      if (state.giveUpIds.has(meta.id)) continue;        // 9.2.1：多次刷新仍读不到母本最高分，本轮已放弃
       if (state.doneIds.has(meta.id)) continue;          // 本轮已处理过
       state.workIndex = i;
       return { R: R, meta: meta, idx: i, boundary: firstReviewedIdx, unreadableId: unreadableId };
@@ -1284,7 +1287,7 @@
   }
 
   // ========== 9.2.0：结束前的「查询」刷新确认 ==========
-  // 扫不到可审行时先别急着收工：列表可能还在刷新（母本没匹配分 / 展开异常都可能是"还没刷新好"），
+  // 扫不到可审行时先别急着收工：列表可能还在刷新（母本最高分读不到 / 展开异常都可能是"还没刷新好"），
   // 所以点「查询」刷新列表再看一眼 —— 默认点两次（CONFIG.endConfirmRounds）。
   // 返回：刷新后出现的可审行对象（说明还没审完，继续审） | null（确认已审完）
   async function confirmReviewFinished(why) {
@@ -1320,7 +1323,7 @@
 
   async function runLoop() {
     let done = false;
-    let abortReason = '';       // 9.1 保护：非正常停止的原因（连续读不到匹配分）
+    let abortReason = '';       // 9.1 保护：非正常停止的原因（连续读不到母本最高分）
     while (state.running) {
       try {
         let target = pickTarget();
@@ -1339,8 +1342,8 @@
 
         const R = target.R, meta = target.meta;
 
-        // ---- 9.2.1：匹配分读不到 = "母本还没刷新好"，不再中断整轮运行 ----
-        // 旧做法（9.1~9.2.0）：相邻 3 行读不到匹配分 → 判为选择器失效，立即停止并弹窗；
+        // ---- 9.2.1：母本最高分读不到 = "母本还没刷新好"，不再中断整轮运行 ----
+        // 旧做法（9.1~9.2.0）：相邻 3 行读不到母本最高分 → 判为选择器失效，立即停止并弹窗；
         //   实际使用中它经常在"列表还在刷新"时误触发（重新点开始又能继续），故改为：
         //   ① 先等加载完成并重读 scoreRetryCount 次（间隔 scoreRetryGapMs）；
         //   ② 读到了 → 用新分数继续正常判定；
@@ -1371,15 +1374,15 @@
 
             if (tries > CONFIG.scoreGiveUpRounds) {
               state.giveUpIds.add(meta.id);          // 本轮不再当候选（结束时会汇总提示）
-              log('⛔ 第' + (target.idx + 1) + '行「' + meta.name + '」匹配分多次刷新仍读不到（第5列原文「' +
+              log('⛔ 第' + (target.idx + 1) + '行「' + meta.name + '」母本最高分多次刷新仍读不到（第5列原文「' +
                 (sc.raw || '(空)') + '」，已试 ' + tries + ' 次）→ 本轮放弃该合集，结束时汇总，可人工处理');
             } else {
-              log('⏸ 第' + (target.idx + 1) + '行「' + meta.name + '」匹配分读不到（第5列原文「' +
+              log('⏸ 第' + (target.idx + 1) + '行「' + meta.name + '」母本最高分读不到（第5列原文「' +
                 (sc.raw || '(空)') + '」，第 ' + tries + '/' + CONFIG.scoreGiveUpRounds + ' 次）→ ' +
                 '视为母本还没刷新好：本轮先跳过它、继续审别的行（刷新列表后自动重试）');
             }
             if (state.notReadyList.length === CONFIG.scoreSkipWarnCount) {
-              log('⚠️ 本轮已有 ' + state.notReadyList.length + ' 个合集读不到匹配分。脚本不会因此停止；' +
+              log('⚠️ 本轮已有 ' + state.notReadyList.length + ' 个合集读不到母本最高分。脚本不会因此停止；' +
                 '但如果整表都读不到，请检查 SELECTORS.parentScoreCell（第5列）是否失效');
             }
             updatePanel();
@@ -1388,7 +1391,7 @@
         }
 
         log('===== 处理 第' + (target.idx + 1) + '行 合集[' + meta.id + ']「' + meta.name +
-          '」集数' + meta.episodes + ' 匹配分' + (meta.score === null ? '-' : meta.score) +
+          '」集数' + meta.episodes + ' 母本最高分' + (meta.score === null ? '-' : meta.score) +
           (meta.isSlow ? '（慢处理）' : '') + ' =====');
 
         const res = await processOneCollection(R, meta);
@@ -1440,7 +1443,7 @@
     if (!done && abortReason) {
       setTimeout(() => alert('⚠️ 脚本已自动停止\n原因：' + abortReason +
         '\n\n已处理 ' + state.processedCount + ' 个合集；本行及之后的行未处理。' +
-        '\n请按 F12 查看控制台「自检」输出，确认 SELECTORS（第2列 id / 第5列匹配分）是否失效。'), 100);
+        '\n请按 F12 查看控制台「自检」输出，确认 SELECTORS（第2列 id / 第5列母本最高分）是否失效。'), 100);
     }
     if (done) {
       const skipText = state.skipList.length > 0
@@ -1449,7 +1452,7 @@
            (state.skipList.length > 10 ? '\n …（其余见面板「复制跳过清单」）' : ''))
         : '\n（无跳过合集）';
       const notReadyText = state.notReadyList.length > 0
-        ? ('\n\n⏸ 还没刷新好（匹配分读不到）' + state.notReadyList.length + ' 个，本轮未处理：\n' +
+        ? ('\n\n⏸ 还没刷新好（母本最高分读不到）' + state.notReadyList.length + ' 个，本轮未处理：\n' +
            state.notReadyList.slice(0, 8).map((s) => ' · [' + s.id + '] ' + s.name +
              '（第' + s.row + '行，第5列原文「' + (s.raw || '(空)') + '」，试了' + (s.tries || 1) + '次）').join('\n') +
            (state.notReadyList.length > 8 ? '\n …（其余见面板日志）' : '') +
@@ -1531,17 +1534,17 @@
           <span>行（每轮扫描起点）</span>
         </div>
         <div class="form-row">
-          <label>匹配分阈值：</label>
+          <label>母本最高分：</label>
           <input type="number" id="parent-threshold" value="${CONFIG.parentScoreThreshold}" min="0" max="100">
-          <span>分以上=有正确数据</span>
+          <span>阈值（仅日志标签）</span>
         </div>
         <div class="form-row">
-          <label>低分下限：</label>
+          <label>母本最低线：</label>
           <input type="number" id="low-floor" value="${CONFIG.lowScoreFloor}" min="0" max="100">
-          <span>低于该分一律全错</span>
+          <span>最高分低于此→全错</span>
         </div>
         <div class="form-row">
-          <label>匹配分重读：</label>
+          <label>母本分重读：</label>
           <input type="number" id="noscore-limit" value="${CONFIG.scoreRetryCount}" min="0" max="9">
           <span>读不到重读N次(0=立即跳过)</span>
         </div>
@@ -1689,7 +1692,7 @@
       '确认弹窗就绪都按此分档）');
     log('等待重试：第 ' + CONFIG.retryAtSec.join('s、') + 's 各重试点击一次（每按钮最多3次）；' +
       '仍无响应 → 永久跳过该合集换下一行（最多跳过 ' + CONFIG.maxSkipCount + ' 个）');
-    log('匹配分读不到（9.2.1）：先等加载完成并重读 ' + CONFIG.scoreRetryCount + ' 次（间隔 ' +
+    log('母本最高分读不到（9.2.1）：先等加载完成并重读 ' + CONFIG.scoreRetryCount + ' 次（间隔 ' +
       CONFIG.scoreRetryGapMs + 'ms）；仍读不到 → 视为"母本还没刷新好"，本轮跳过该合集、继续审别的行，' +
       '刷新列表后自动重试并在结束时汇总（不再中断整轮运行）');
     log('扫描与结束（9.2.0）：每轮从第' + CONFIG.startRow + '行往下扫；「已审核」视为边界（下面都已审过）；' +
@@ -1697,17 +1700,18 @@
       CONFIG.endConfirmRounds + ' 次，确认没有未审核行才判定审核结束');
     log('关键词（9.4.0：已取消终极关键词，全部双列比对；第3列命中的词第4列缺任一个 → 全错）｜当前表：' +
       CONFIG.nameKeywords.join('、'));
-    log('低分保护：匹配分 < ' + CONFIG.lowScoreFloor + ' → 一律全错，不看状态码 ' +
-      CONFIG.judgeCodes.join('/') + (CONFIG.lowScoreFloor > 0 ? '' : '（当前已关闭）'));
-    log('判定（9.4.0）：' +
+    log('母本最低线：母本最高分(第5列) < ' + CONFIG.lowScoreFloor +
+      ' → 一律全错（90 分是底线，即使 777/601 够多也不救），当前状态码 ' +
+      CONFIG.judgeCodes.join('/') + (CONFIG.lowScoreFloor > 0 ? '' : '（当前最低线已设为 0 = 关闭）'));
+    log('判定（9.4.1）：' +
       '①关键词：第3列命中的词第4列缺任一个→全错（已取消终极关键词） ' +
-      '②匹配分<' + CONFIG.lowScoreFloor + '→全错（硬规则，不看子样本） ' +
+      '②母本最高分<' + CONFIG.lowScoreFloor + '→全错（硬规则，不看子样本） ' +
       '③其余一律展开核对（得分=0/读不到的条不计入统计）：' +
       '低分(<' + CONFIG.lowScoreThreshold + ')条数 > 正确数据条数 → 全错（优先）；' +
       '否则 得分≥' + CONFIG.highScoreThreshold + ' 的条数≥' + CONFIG.highScoreMinCount +
       ' 或 ' + CONFIG.judgeCodes.join('/') + ' 各自≥' + CONFIG.correctCodeMinCount +
       '（有效行≤' + CONFIG.smallCollectionMaxRows + ' 条的小合集：≥' + CONFIG.correctCodeMinCountSmall +
-      '）→模式1，都不满足→模式2；相似度与匹配分只写日志、不再决定通过与否');
+      '）→模式1，都不满足→模式2；相似度与母本最高分只写日志、不再决定通过与否');
     log('模式2 收尾：批量错误(594)完成后点击「' + CONFIG.queryBtnText + '」刷新列表，不再点「全剧审核」');
     log('（面板已不再显示判定说明，完整规则见本段日志与源码注释）');
     log('判定日志上报：' + (CONFIG.reportEnabled
@@ -1725,7 +1729,7 @@
     document.querySelector('#stop-btn').disabled = true;
   }
 
-  // 结构自检：输出首行解析到的 ID/名字/匹配分/集数/状态，方便确认选择器是否失效
+  // 结构自检：输出首行解析到的 ID/名字/母本最高分/集数/状态，方便确认选择器是否失效
   function debugStructure() {
     try {
       const rows = qsa(document, SELECTORS.parentRow);
@@ -1733,7 +1737,7 @@
         const meta = getCollectionMeta(rows[i]);
         const sim = checkSimilarOriginalName(rows[i], meta);
         console.log('[自检] 第' + (i + 1) + '行 → ID:[' + meta.id + '] 短剧名:[' + meta.name +
-          '] 原短剧名:[' + meta.originalName + '] 匹配分:' + (meta.score === null ? '-' : meta.score) +
+          '] 原短剧名:[' + meta.originalName + '] 母本最高分:' + (meta.score === null ? '-' : meta.score) +
           ' 集数:' + meta.episodes + ' 状态:[' + getRowStatus(rows[i]) + ']');
         console.log('[自检] 第' + (i + 1) + '行 相似判定（所有文本都算） → ' + (sim.similar ? '相似' : '不相似') +
           '（' + sim.detail + '）');
