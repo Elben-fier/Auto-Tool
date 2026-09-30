@@ -66,8 +66,9 @@ python server.py      # 或双击 run.bat（会自动安装依赖）
 | `/detect_batch` | POST | base64 图片批量人像检测 → `{"results": [bool, ...]}`（兼容旧脚本） |
 | `/detect_batch_detail` | POST | 批量**明细**检测（人物/人脸/手机/屏幕 + 置信度，阈值可由前端传入） |
 | `/compare` | POST | 两两图片相似度（第5列 vs 第6列） |
+| `/review_batch` | POST | **合并接口（10.1）**：一次请求同时做「相似度 + 人物/手机/屏幕检测」；相似度不过阈值直接返回、跳过 YOLO |
 | `/debug_screenshot` | POST | 调试：按坐标截屏存盘 |
-| `/judge_log` | POST | **判定日志上报**（短剧审核脚本每条判定 POST 一次） |
+| `/judge_log` | POST | **判定日志上报**（短剧审核 / VB短视频审核10.1 每条判定 POST 一次；含 `kind`、`dataId`、`detailText` 列） |
 | `/judge_log` | GET | 查询判定日志（`limit/offset/mode/outcome/q`） |
 | `/judge_log/stats` | GET | 判定日志统计（按结果/模式/匹配分/原因） |
 | `/judge_log/export` | GET | 判定日志导出 CSV（带 BOM，Excel 直接打开） |

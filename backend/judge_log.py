@@ -32,6 +32,8 @@ judge_log_bp = Blueprint("judge_log", __name__)
 # CSV / 表格列定义：(内部字段, 表头)
 COLUMNS = [
     ("time", "时间"),
+    ("kind", "类型"),
+    ("dataId", "数据id(第2列)"),
     ("childId", "子样本首条id"),
     ("parentId", "母本合集id"),
     ("name", "短剧名"),
@@ -51,6 +53,7 @@ COLUMNS = [
     ("ultimate", "终极关键词"),
     ("reason", "判定原因"),
     ("simDetail", "相似明细"),
+    ("detailText", "检测明细"),
     ("isSlow", "慢合集"),
     ("version", "脚本版本"),
     ("received_at", "服务端接收时间"),

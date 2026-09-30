@@ -354,6 +354,134 @@ def debug_screenshot():
 
 
 # ---------------------------------------------------------------------------
+# 合并接口：相似度 + 人物/手机/屏幕检测（VB短视频审核10.1 专用）
+# ---------------------------------------------------------------------------
+def _b64_to_img(b64):
+    if not b64:
+        return None
+    try:
+        img_bytes = base64.b64decode(b64)
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
+@app.route("/review_batch", methods=["POST", "OPTIONS"])
+def review_batch():
+    """
+    一行同时完成「第5列 vs 第6列 相似度」+「第5列图 人物/手机/屏幕 检测」：
+      请求: {"items": [{"col5": b64, "col6": b64|null}, ...],
+             "person_conf": 0.35, "object_conf": 0.55,
+             "sim_threshold": 0.40, "skip_detect_when_sim_low": true}
+      响应: {"results": [{"decode_failed": bool, "sim_ok": bool, "sim": 0~1, "ssim": ..., "aspect": ...,
+                          "detect_skipped": bool, "person": bool, "face": bool, "phone": bool,
+                          "screen": bool, "ok": bool, "conf": {...}, "reason": "..."}, ...]}
+
+    为什么合并（相比"先 /detect_batch_detail 再 /compare"）：
+      · 第5列图只下载一次、只传输一次、只解码一次（原来要两遍）
+      · 相似度不过阈值 → 直接返回，不再跑 YOLO（省 CPU，判定结果与原流程完全一致）
+      · 一次 HTTP 往返代替两次
+    限速：相似度占 1 个名额；确实需要检测时再占 1 个（与原来"检测+比对各占一次"持平）。
+    """
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+
+    if task_queue.is_full:
+        logger.warning("任务队列已满，返回 429 (review_batch)")
+        return jsonify({"error": "队列已满"}), 429
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "请求体为空"}), 400
+    items = data.get("items")
+    if not isinstance(items, list) or len(items) == 0:
+        return jsonify({"error": "缺少 items 参数"}), 400
+
+    def _opt(key):
+        v = data.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    person_conf = _opt("person_conf")
+    object_conf = _opt("object_conf")
+    sim_threshold = _opt("sim_threshold")
+    skip_low = data.get("skip_detect_when_sim_low", True)
+
+    results = []
+    n_skip = 0
+    for it in items:
+        rec = {
+            "ok": False, "decode_failed": False, "sim_ok": False, "sim": None,
+            "ssim": None, "hash8": None, "hash16": None, "hist": None, "aspect": None,
+            "detect_skipped": False,
+            "person": None, "face": None, "phone": None, "screen": None, "conf": {},
+            "reason": "",
+        }
+        acq = 0
+        try:
+            if not task_queue.acquire():
+                rec["reason"] = "队列已满"
+                results.append(rec)
+                continue
+            acq += 1
+
+            img5 = _b64_to_img(it.get("col5") if isinstance(it, dict) else None)
+            img6 = _b64_to_img(it.get("col6") if isinstance(it, dict) else None)
+            if img5 is None:
+                rec["decode_failed"] = True
+                rec["reason"] = "第5列图解码失败"
+                results.append(rec)
+                continue
+
+            if img6 is not None:
+                sim = image_similarity(img5, img6)
+                rec["sim_ok"] = bool(sim.get("ok"))
+                rec["sim"] = sim.get("sim")
+                rec["ssim"] = sim.get("ssim")
+                rec["hash8"] = sim.get("hash8")
+                rec["hash16"] = sim.get("hash16")
+                rec["hist"] = sim.get("hist")
+                rec["aspect"] = sim.get("aspect")
+
+            low_sim = (rec["sim_ok"] and sim_threshold is not None
+                       and rec["sim"] is not None and rec["sim"] < sim_threshold)
+            if low_sim and skip_low:
+                rec["detect_skipped"] = True
+                rec["reason"] = "相似度低(%.3f) → 跳过检测" % rec["sim"]
+                n_skip += 1
+            else:
+                if not task_queue.acquire():
+                    rec["reason"] = "队列已满(检测)"
+                    results.append(rec)
+                    continue
+                acq += 1
+                det = face_detector.detect_detail(img5, person_conf=person_conf, object_conf=object_conf)
+                rec["ok"] = bool(det.get("ok"))
+                rec["person"] = det.get("person")
+                rec["face"] = det.get("face")
+                rec["phone"] = det.get("phone")
+                rec["screen"] = det.get("screen")
+                rec["conf"] = det.get("conf", {})
+        except Exception:
+            logger.error("合并送检异常:\n%s", traceback.format_exc())
+            rec["reason"] = "异常"
+        finally:
+            for _ in range(acq):
+                task_queue.release()
+        results.append(rec)
+
+    logger.info("合并送检: %d 条 → 跳过检测(相似度低) %d 条 (person_conf=%s, object_conf=%s, sim_threshold=%s)",
+                len(items), n_skip,
+                "默认" if person_conf is None else person_conf,
+                "默认" if object_conf is None else object_conf,
+                sim_threshold)
+    return jsonify({"results": results})
+
+
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 60)
     print("  短剧审核自动识别勾选工具 — 后端服务")
@@ -361,5 +489,6 @@ if __name__ == "__main__":
     print("  速率限制: 4.5 张/秒（按图片张数计数，非按请求）")
     print("  检测模型: YOLOv8n(person) + YuNet(人脸兜底)  [离线]")
     print("  判定日志: POST /judge_log   查看 http://127.0.0.1:5002/judge_log/view")
+    print("  合并送检: POST /review_batch（相似度+人物/手机/屏幕，一次搞定）")
     print("=" * 60)
     app.run(host="127.0.0.1", port=5002, threaded=False)
