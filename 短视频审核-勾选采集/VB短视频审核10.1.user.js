@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VB短视频审核10.1
 // @namespace    https://doubao.com/userscripts
-// @version      10.1.0
+// @version      10.1.1
 // @description  qualityTest 一页一轮自动审核：合并接口一次拿「相似度+人物/手机/屏幕」（相似度不过自动跳过检测，图只下一次）→ 勾错误行批量错误 → 表头全选勾正确行批量正确 → 等下一页；判定结果可上报后端日志（id 取第2列）
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/qualityTest*
@@ -10,6 +10,22 @@
 // @connect      *
 // @run-at       document-end
 // ==/UserScript==
+
+// ============================== 10.1.1 修订（10.1 的修正版） ==============================
+//  【1】上报的 id 加强：第2列 id（dataId）+ 第15列 key_id + antd 行 key 三个都记，
+//       仅当第2列为空时额外记整行文本（诊断用）；开跑时打印"列自检"（前3行的第2/7/8/15列）。
+//  【2】送检顺序彻底改成"先相似度 → 再对剩余行做 YOLO"：
+//       有 /review_batch 时用合并接口（一次请求、图只下一次）；
+//       没有该接口（旧后端）时，也改成【先 /compare 全部 → 相似度不达标的直接判错、不送检测
+//       → 只对剩下的行 /detect_batch_detail】，不再沿用旧的"先整批 YOLO"。
+//  【3】离开一会就"自动暂停"的四种保险：
+//       ① 列表空了不再直接结束 → 点「查 询」刷新确认（默认连续 2 次仍空才算清完）；
+//       ② 本轮异常（含严格等待超时）不再立刻停止 → 默认重试 2 次；
+//       ③ 最大页数上限 50 → 999（不再跑一会就到顶停止）；
+//       ④ 标签页在后台时提示（浏览器会节流定时器导致变慢）。
+//  【4】勾正确行的"表头全选"校验改严：必须与正确行数完全相等，否则退回逐行勾选（防止表格
+//       补入下一页数据时把新页的行也一起批量正确）。
+// ==============================================================================
 
 // ============================== 10.1.0 更新记录 ==============================
 //  【一】勾选正确行改为「表头全选」：批量错误之后错误行已从表格消失，剩下的本来就全是正确行，
@@ -80,7 +96,12 @@
     nextPageWaitMax: 30000,       // 等"下一页数据"最长等待
     stableMs: 1200,               // 表格稳定判定时间
     checkInterval: 400,           // 轮询间隔
-    maxRounds: 50,                // 最多处理多少页（安全上限）
+    maxRounds: 999,               // 最多处理多少页（10.1.1：50 → 999，避免跑一会就到上限停止）
+    // —— 10.1.1 防"自动暂停" ——
+    emptyConfirmTimes: 2,         // 列表空了 → 点「查询」确认几次（连续这么多次仍空才算清完）
+    maxProblemRetries: 2,         // 本轮异常（含等待超时）允许重试几次，超过才停止
+    problemRetryDelayMs: 5000,    // 重试前的等待
+    queryBtnText: '查询',         // 刷新列表用的按钮文本（antd 渲染成"查 询"，脚本按去空格比较）
     // —— 合并送检（10.1：相似度 + 检测一次搞定）——
     useReviewApi: true,           // true=用合并接口 /review_batch（后端不支持会自动退回两步调用）
     reviewApiPath: '/review_batch',
@@ -121,6 +142,7 @@
     lastWrongKeys: [],
     lastCorrectKeys: [],
     lastDetails: [],     // 最近一页的逐行明细（供「复制明细」使用）
+    problemRetries: 0,   // 10.1.1：连续异常次数（用于"异常重试"）
   };
 
   // =======================================================================
@@ -343,10 +365,12 @@
     const url5 = cellImg(SEL.imageCol5);
     const url6 = cellImg(SEL.imageCol6);
     const dataIdEl = row.querySelector(SEL.dataIdCell);
+    const keyIdEl2 = row.querySelector(SEL.keyIdCell);
     return {
       row: row,
       key: row.getAttribute('data-row-key') || '',
       dataId: dataIdEl ? (dataIdEl.textContent || '').replace(/\s+/g, '').trim() : '',
+      keyId2: keyIdEl2 ? (keyIdEl2.textContent || '').trim() : '',
       keyId: keyIdEl ? (keyIdEl.textContent || '').trim() : '',
       name: nameEl ? (nameEl.textContent || '').trim() : '',
       score: isNaN(score) ? null : score,
@@ -385,6 +409,64 @@
       if (checkRow(row)) { done++; await delay(25); }
     }
     return done;
+  }
+
+  // ========== 页面「查询」按钮 + 空态确认（10.1.1）==========
+  // 定位：页面级 primary 按钮 → 文本去掉空格后等于 queryBtnText；排除自己的面板与弹窗
+  function findQueryButton() {
+    const pick = (list) => {
+      for (const b of list) {
+        if (b.closest('#v1-panel')) continue;
+        if (b.closest('.ant-popconfirm') || b.closest('.ant-modal-wrap')) continue;
+        if (b.disabled) continue;
+        const r = b.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        const txt = (b.textContent || '').replace(/\s+/g, '');
+        if (txt === CONFIG.queryBtnText) return b;
+      }
+      return null;
+    };
+    return pick(document.querySelectorAll('button.ant-btn-primary')) ||
+           pick(document.querySelectorAll('button'));
+  }
+
+  async function clickQuery() {
+    const btn = findQueryButton();
+    if (!btn) { log('⚠️ 未找到「' + CONFIG.queryBtnText + '」按钮（页面可能改版）'); return false; }
+    if (!(await waitLoadingDone('点击「' + CONFIG.queryBtnText + '」前'))) return false;
+    log('点击「' + CONFIG.queryBtnText + '」刷新列表...');
+    safeClick(btn);
+    return true;
+  }
+
+  // 是否处于 antd 空态（"暂无数据"）
+  function isEmptyState() {
+    const e = document.querySelector('.ant-empty');
+    if (e && isVisible(e)) return true;
+    return getRows().length === 0;
+  }
+
+  // 列表空了 → 点「查询」刷新并确认：连续 confirmTimes 次都空 → 返回 true（确实清完）
+  // 一旦刷出数据 → 返回 false（还没清完，继续处理）
+  async function confirmListEmpty(confirmTimes) {
+    const times = confirmTimes || CONFIG.emptyConfirmTimes;
+    for (let i = 1; i <= times; i++) {
+      setStatus('列表空了 → 点「' + CONFIG.queryBtnText + '」确认（第 ' + i + '/' + times + ' 次）...');
+      log('列表为空 → 点「' + CONFIG.queryBtnText + '」刷新确认（第 ' + i + '/' + times + ' 次）');
+      await clickQuery();
+      if (CONFIG.strictLoading && !(await waitLoadingDone('查询刷新'))) {
+        log('⚠️ 查询刷新等待超时（不轻易判定清空，继续下一轮确认）');
+        continue;
+      }
+      await waitForTableSettled(8000, CONFIG.stableMs);
+      const n = getRows().length;
+      if (n > 0) {
+        log('查询后出现数据：' + n + ' 行 → 说明还没清完，继续处理');
+        return false;
+      }
+      log('第 ' + i + ' 次确认：仍然无数据' + (isEmptyState() ? '（页面显示"暂无数据"）' : ''));
+    }
+    return true;
   }
 
   // 统计当前页已勾选的行数（用于"表头全选"后核对）
@@ -501,8 +583,10 @@
         kind: 'video',
         script: 'VB短视频审核10.1',
         version: '10.1.0',
-        dataId: it.dataId || '',                 // ← 第2列的审核数据 id
+        dataId: it.dataId || '',                 // ← 第2列的审核数据 id（10.1.1 主字段）
+        keyId: it.keyId2 || it.keyId || '',      // ← 第15列 key_id（一并记录，便于核对）
         rowKey: it.key || '',
+        rowText: (it.dataId ? '' : ((it.row && it.row.textContent) || '').replace(/\s+/g, ' ').trim().slice(0, 120)),
         childId: '',
         parentId: '',
         name: it.name || '',
@@ -617,7 +701,17 @@
       const rows = getRows();
       const count = rows.length;
       const firstKey = count > 0 ? rows[0].getAttribute('data-row-key') : null;
-      if (count === 0) return 0;
+      if (count === 0) {
+        // 10.1.1：空列表不直接结束 → 点「查询」刷新确认（连续 N 次仍空才算清完）
+        if (await confirmListEmpty()) return 0;
+        const n2 = getRows().length;
+        if (n2 > 0) {
+          await waitForTableSettled(15000, CONFIG.stableMs);
+          await waitLoadingDone('查询后数据渲染');
+          return getRows().length;
+        }
+        continue;
+      }
       if (firstKey && firstKey !== beforeFirstKey && !isLoading()) {
         await waitForTableSettled(15000, CONFIG.stableMs);
         await waitLoadingDone('下一页数据渲染');
@@ -762,16 +856,28 @@
       if (!(await waitLoadingDone('图片加载完成'))) return 'problem';
     }
 
-    const rows = getRows();
+    let rows = getRows();
     if (rows.length === 0) {
-      log('当前页无数据，处理结束');
-      return 'empty';
+      // 10.1.1：空页可能只是"还没刷新出来" → 点「查询」确认；连续确认仍空才算清完
+      log('当前页无数据 → 点「' + CONFIG.queryBtnText + '」刷新确认...');
+      if (await confirmListEmpty()) {
+        log('连续 ' + CONFIG.emptyConfirmTimes + ' 次确认仍无数据 → 处理结束');
+        return 'empty';
+      }
+      rows = getRows();
+      if (rows.length === 0) { log('刷新后仍无数据，处理结束'); return 'empty'; }
+      log('刷新后出现 ' + rows.length + ' 行 → 继续处理');
     }
     const firstKeyBefore = getFirstRowKey();
     log('===== 第 ' + (state.rounds + 1) + ' 页：共 ' + rows.length + ' 行，开始检测 =====');
 
     // 1) 采集行信息
     const items = rows.map(collectRowInfo);
+    // 10.1.1：列自检（前 3 行）—— 确认"第2列 id / 第15列 key_id"取对没有
+    log('列自检（前3行）：' + items.slice(0, 3).map((it, i) =>
+      '#' + (i + 1) + ' 第2列=[' + (it.dataId || '空') + '] 第7列=[' + (it.name || '').slice(0, 8) +
+      '] 第8列=[' + (it.score === null ? '空' : it.score) + '] 第15列=[' + (it.keyId2 || '').slice(0, 14) + ']'
+    ).join(' ｜ '));
 
     // 2) 低分行先直接判错（不送检测，省时间）；其余行才送检测
     const toDetect = [];
@@ -782,12 +888,13 @@
     log('得分 ≤ ' + CONFIG.scoreWrongMax + ' 直接判错 ' + (items.length - toDetect.length) + ' 条；' +
       '送检测 ' + toDetect.length + ' 条');
 
-    // 2) 送检（10.1 合并接口）：一次请求同时拿「相似度 + 人物/手机/屏幕检测」
-    //     后端先算相似度：不过阈值 → 直接返回（跳过 YOLO）；第5列图只下载/传输一次
-    //     若后端是旧版（没有 /review_batch）→ 自动退回"先检测、再相似度"两步调用
-    setStatus('合并送检中（' + toDetect.length + ' 条，每批 ' + CONFIG.batchSize + ' 条）...');
-    let mergedOk = CONFIG.useReviewApi;
-    if (mergedOk && toDetect.length > 0) {
+    // 2) 送检（10.1.1：一律「先相似度 → 再对剩余行做 YOLO」）
+    //    ① 有合并接口 /review_batch → 一次请求（后端先算相似度，不过阈值就直接返回、不跑 YOLO）
+    //    ② 后端是旧版（没有该接口）→ 先整批 /compare，相似度不达标的直接判错、不送检测；
+    //       只对"相似度达标 / 缺图"的行调 /detect_batch_detail
+    let mergedOk = CONFIG.useReviewApi && CONFIG.checkSimilarity && toDetect.length > 0;
+    if (mergedOk) {
+      setStatus('合并送检中（' + toDetect.length + ' 条，每批 ' + CONFIG.batchSize + ' 条）...');
       for (let i = 0; i < toDetect.length; i += CONFIG.batchSize) {
         if (!state.running) return 'stopped';
         const batch = toDetect.slice(i, i + CONFIG.batchSize);
@@ -797,16 +904,8 @@
         setStatus('合并送检进度 ' + Math.min(i + batch.length, toDetect.length) + ' / ' + toDetect.length);
       }
     }
-    if (!mergedOk) {
-      // —— 兼容旧后端：先检测、再相似度（与旧版完全一致）——
-      setStatus('检测中（' + toDetect.length + ' 条，每批 ' + CONFIG.batchSize + ' 张）...');
-      for (let i = 0; i < toDetect.length; i += CONFIG.batchSize) {
-        if (!state.running) return 'stopped';
-        const batch = toDetect.slice(i, i + CONFIG.batchSize);
-        const res = await detectBatch(batch.map((x) => x.item));
-        res.forEach((v, j) => { batch[j].item.det = v; });
-        setStatus('检测进度 ' + Math.min(i + batch.length, toDetect.length) + ' / ' + toDetect.length);
-      }
+    if (toDetect.length > 0 && !mergedOk) {
+      // —— ① 先整批算相似度 ——
       if (CONFIG.checkSimilarity) {
         setStatus('相似度比对中（' + toDetect.length + ' 对）...');
         for (let i = 0; i < toDetect.length; i += CONFIG.batchSize) {
@@ -817,6 +916,31 @@
           res.forEach((v, j) => { batch[j].item.cmp = v; });
           setStatus('相似度进度 ' + Math.min(i + batch.length, toDetect.length) + ' / ' + toDetect.length);
         }
+      }
+      // —— ② 只对"相似度达标 / 缺图"的行做检测（相似度不达标的直接判错，省掉 YOLO）——
+      const needDetect = toDetect.filter((x) => {
+        const c = x.item.cmp;
+        if (!c || !c.ok) return true;                  // 缺图/比对失败 → 仍需检测
+        return c.sim >= CONFIG.simThreshold;           // 相似度达标才需要检测
+      });
+      const skipped = toDetect.length - needDetect.length;
+      if (skipped > 0) {
+        log('先相似度：' + skipped + ' 条相似度不达标 → 直接判错（已跳过 YOLO），剩余 ' +
+          needDetect.length + ' 条送检测');
+        toDetect.forEach((x) => {
+          const c = x.item.cmp;
+          if (c && c.ok && c.sim < CONFIG.simThreshold) {
+            // 占位 det：判定顺序里"相似度低"会先命中，判定结果与原因与旧流程一致
+            x.item.det = { person: null, face: null, phone: null, screen: null, ok: false, conf: {}, skipped: true };
+          }
+        });
+      }
+      for (let i = 0; i < needDetect.length; i += CONFIG.batchSize) {
+        if (!state.running) return 'stopped';
+        const batch = needDetect.slice(i, i + CONFIG.batchSize);
+        const res = await detectBatch(batch.map((x) => x.item));
+        res.forEach((v, j) => { batch[j].item.det = v; });
+        setStatus('检测进度 ' + Math.min(i + batch.length, needDetect.length) + ' / ' + needDetect.length);
       }
     }
 
@@ -1019,10 +1143,14 @@
         if (selAll) {
           if (!selAll.checked) { safeClick(selAll); await delay(400); }
           checked = countCheckedRows();
-          if (checked >= aliveKeys.length) {
+          if (checked === aliveKeys.length) {
             log('表头全选已勾选 ' + checked + ' 行（错误行已全部消失，剩下的都是正确行）');
           } else {
-            log('⚠️ 表头全选只勾到 ' + checked + ' / ' + aliveKeys.length + ' 行 → 退回逐行勾选');
+            // 10.1.1：必须完全相等 —— 多勾（例如表格补入了下一页数据）也退回逐行勾选，避免误提交
+            log('⚠️ 表头全选勾到 ' + checked + ' 行，与正确行数 ' + aliveKeys.length +
+              ' 不一致 → 退回逐行勾选（更安全）');
+            const selAllReset = document.querySelector(SEL.selectAll);
+            if (selAllReset && selAllReset.checked) { safeClick(selAllReset); await delay(300); }
             checked = await checkRowsByKeys(aliveKeys);
           }
         } else {
@@ -1081,7 +1209,20 @@
       if (outcome === 'scan') { log('只扫描模式结束（未勾选未提交）'); break; }
       if (outcome === 'check') { log('测试模式结束（已勾选错误行，未提交）'); break; }
       if (outcome === 'empty' || outcome === 'done') break;
-      if (outcome === 'problem') { log('本轮异常，停止运行'); break; }
+      if (outcome === 'problem') {
+        // 10.1.1：本轮异常（等待超时/页面抖动等）不再立刻停止 → 重试几次，超过上限才停
+        state.problemRetries = (state.problemRetries || 0) + 1;
+        if (state.problemRetries <= CONFIG.maxProblemRetries) {
+          log('⚠️ 本轮异常（第 ' + state.problemRetries + '/' + CONFIG.maxProblemRetries + ' 次）→ ' +
+            Math.round(CONFIG.problemRetryDelayMs / 1000) + 's 后重试本页（不停止）');
+          setStatus('异常，' + Math.round(CONFIG.problemRetryDelayMs / 1000) + 's 后重试本页...');
+          await delay(CONFIG.problemRetryDelayMs);
+          continue;
+        }
+        log('本轮异常连续 ' + state.problemRetries + ' 次 → 停止运行（请检查页面/后端/网络）');
+        break;
+      }
+      state.problemRetries = 0;   // 正常完成一轮 → 清零
       if (state.rounds >= CONFIG.maxRounds) { log('已达最大页数 ' + CONFIG.maxRounds + '，停止'); break; }
     }
     stopRun();
@@ -1327,11 +1468,18 @@
     reportCooldownUntil = 0;
     reportWarned = false;
     reportOkLogged = false;
+    state.problemRetries = 0;
     document.querySelector('#v1-start').disabled = true;
     document.querySelector('#v1-scan').disabled = true;
     document.querySelector('#v1-stop').disabled = false;
     updatePanel();
     log('===== 开始处理（' + (state.mode === 'check' ? '测试模式：会自动勾选错误行，但不点批量按钮' : '正式模式：会自动勾选并点击提交') + '）=====');
+    log('防暂停保险：列表空→点「' + CONFIG.queryBtnText + '」确认 ' + CONFIG.emptyConfirmTimes +
+      ' 次｜本轮异常重试 ' + CONFIG.maxProblemRetries + ' 次｜最大页数 ' + CONFIG.maxRounds +
+      '｜后台标签页会被浏览器节流(变慢)');
+    if (document.hidden) {
+      log('⚠️ 当前标签页在后台：浏览器会降低定时器频率，脚本会明显变慢，建议保持本页在前台可见');
+    }
     runLoop();
   }
 

@@ -34,6 +34,7 @@ COLUMNS = [
     ("time", "时间"),
     ("kind", "类型"),
     ("dataId", "数据id(第2列)"),
+    ("keyId", "key_id"),
     ("childId", "子样本首条id"),
     ("parentId", "母本合集id"),
     ("name", "短剧名"),
