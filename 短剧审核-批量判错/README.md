@@ -204,4 +204,5 @@
 - 脚本会真实执行「批量错误」「全剧审核」，属**不可逆业务操作**，请先在少量数据上验证关键词与阈值；
 - 同一页面请勿同时启用多个短剧审核脚本；
 - 合集名命中关键词的规则**极易命中**（含"剧""动""画""漫"等单字）：v9.4.0 起是"**第3列命中的词第4列缺任一个就全错**"，词表里重叠的单字会让"只差几个字"的正常组合也被判错 —— 如发现大量合集被判全错，请精简 `nameKeywords` 里的单字；
-- 9.1.7 之后「通过与否」只由**子样本质量**（高分条数 / 777·601 条数）决定，相似度与匹配分**不再参与决策**，仅作日志留痕 —— 想调整松紧只改 `highScoreThreshold` / `highScoreMinCount` / `correctCodeMinCount` / `correctCodeMinCountSmall` / `smallCollectionMaxRows` / `lowScoreFloor`。
+- 9.1.7 之后「通过与否」只由**子样本质量**（高分条数 / 777·601 条数）决定，相似度与匹配分**不再参与决策**，仅作日志留痕 —— 想调整松紧只改 `highScoreThreshold` / `highScoreMinCount` / `correctCodeMinCount` / `correctCodeMinCountSmall` / `smallCollectionMaxRows` / `lowScoreFloor`；
+- ⚠️ **子样本状态码只认 777/601/594/0**：实机日志里还出现过 **591/592/595**，运营只说明了 777/601 的含义。这些未知码**不计入"正确数据"，且会在模式2 里被"全选 + 批量错误"一起改成 594**。若日后确认它们代表"已判定正确/已审核"，需把它们加进 `CONFIG.judgeCodes`，并确认模式2 全选时是否该跳过它们。
