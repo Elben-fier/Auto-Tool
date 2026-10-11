@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.2】
 // @namespace    https://doubao.com/userscripts
-// @version      9.2.1
+// @version      9.2.2
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（关键词双列比对、母本最高分(第5列)<90）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含关键词双列比对（命中词第4列缺任一即全错）、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -71,7 +71,22 @@
 //  规则拆解：docs/短剧审核9.1判定机制详解.md ｜ 逐版本变更史：docs/版本演进记录.md
 //  注：9.2.2 仅把原先堆在这里的 164 行逐版变更记录并入上述文档，脚本代码未改动。
 // ==========================================================================
-// ============================== 9.2.1 系统更新：0 分行不会被改成 594（判错完成判定只认"有效行"） ==============================
+// ============================== 9.2.2 系统更新补充：777 也不会被改成 594 → 判错完成只等"待判行清零" ==============================
+//  【系统更新（2026-10-11 实机补充）】批量错误**只会把"未判定(状态码 0/空)"的行改成 594**；
+//      下面这两类行**状态码不会变**：
+//        · 得分为 0 / 读不到的行（原码保留）
+//        · 状态码 777（以及同族的 601 等"前人已判定"的码）
+//  【影响】9.2.1 用的"有效行全部 = 594"仍然等不到 —— 只要有效行里有 1 条 777，
+//      `validWrong === valid` 就永远不成立 → 依旧白等 90/150s 后把成功的合集当异常永久跳过。
+//  【本次】完成判定改为 **"有效行里已无『未判定(0/空)』的行"**（新增 `pendingValid`）：
+//      · getCodeStats 新增 `pendingValid`（有效行里状态码为 0 或空的条数）
+//      · waitAllJudged 完成条件 = `pendingValid === 0 && 无转圈`；
+//        `validWrong`/`wrong`/`notWrong` 全部退化为日志与进度展示
+//      · 状态栏/日志改为显示"待判(0) 还剩 N 条"，并注明 0分行与 777·601 行不参与等待
+//      · 一条有效行都没有时仍然直接视为这一步完成（打警告日志）
+//  【不变】判定规则、展开核对、扫描与结束、预演、慢处理等全部不动。
+// ==========================================================================
+// ============================== 9.2.1 系统更新：0 分行不会被改成 594（第一版尝试，已被 9.2.2 取代） ==============================
 //  【系统更新（2026-10-11 实机）】批量错误之后，**"得分为 0/读不到"的行状态码不会变**
 //      （它们仍是原码，不会变成 594）。
 //  【影响】旧判据是"全部子样本 = 594 才算判错完成" → 只要合集里有 1 条 0 分行，
@@ -81,6 +96,7 @@
 //  【本次】完成判定改为只看**有效行**（有效行 = 得分非 0 且可读的行）：
 //      · getCodeStats 新增 `validWrong`（有效行里已是 594 的条数）
 //      · waitAllJudged 用 "validWrong === valid && 无转圈" 判完成（进度条也按有效行显示）
+//        ⚠️ 该判据在 9.2.2 被证明仍不够（有效行里有 777 时同样永远等不到）→ 已改为"待判行清零"
 //      · 若**一条有效行都没有** → 系统不会产生任何 594，直接视为"批量错误这一步已完成"，
 //        并打印警告日志（继续走 查询刷新），不再白等
 //      · 日志/超时原因都改为按有效行口径，并注明有多少条 0 分行被忽略
@@ -614,7 +630,8 @@
     let scoreLow = 0;           // 9.3.0：0 < 得分 < lowScoreThreshold(80) 的条数
     let notReady = 0;           // 9.3.0：得分 = 0 或读不到 → 视为还没刷新，不计入判定统计
     let correct = 0;            // 9.3.0：正确数据行数（判定码 777/601 或 高分；同一行只算一次）
-    let validWrong = 0;         // 9.2.1：**有效行**里状态码已是 594 的条数（判错完成判定用）
+    let validWrong = 0;         // 9.2.1：**有效行**里状态码已是 594 的条数（仅用于日志/进度展示）
+    let pendingValid = 0;       // 9.2.2：**有效行**里仍是"未判定(0/空)"的条数 —— 判错完成就等它清零
     const judgeCounts = {};     // 9.1.1：各 judgeCode 的子样本条数，如 {777: 5, 601: 0}
     CONFIG.judgeCodes.forEach((c) => { judgeCounts[c] = 0; });
     rows.forEach((row) => {
@@ -637,6 +654,8 @@
 
       scoreKnown++;
       if (code === CONFIG.wrongCode) validWrong++;     // 9.2.1：只数"有效行"的 594
+      // 9.2.2：系统只会把"未判定(0/空)"的行改成 594；0分行与 777/601 等"已判定"行都不会变
+      if (code === CONFIG.unjudgedCode || code === '') pendingValid++;
       if (isHigh) scoreHigh++;
       else if (sc < CONFIG.lowScoreThreshold) scoreLow++;
     });
@@ -652,7 +671,8 @@
       unjudged: unjudged,
       wrong: wrongCount,                 // 已是 594 的行数（全部行，含没刷新的；仅用于日志展示）
       notWrong: rows.length - wrongCount, // 还不是 594 的行数（全部行；仅用于日志展示）
-      validWrong: validWrong,            // 9.2.1：有效行里已是 594 的条数（判错完成判定用）
+      validWrong: validWrong,            // 9.2.1：有效行里已是 594 的条数（展示用）
+      pendingValid: pendingValid,        // 9.2.2：有效行里仍是"未判定(0/空)"的条数（判错完成判定用）
       counters: counters,
       detail: detail,
       judgeCounts: judgeCounts,          // 各 judgeCode 的条数
@@ -977,12 +997,14 @@
     }
   }
 
-  // ========== 等待全部子样本变成 594（判错完成） ==========
-  // 模式2 的"等响应"：批量错误提交后，必须满足才算完成：
-  //   ① **有效行**的状态码都是 594（有效行 = 得分非 0 且可读的行）
-  //      9.2.1 实测：系统对"得分为 0/读不到"的行**不会改状态码**（批量错误后它们仍是原码），
-  //      所以完成判定**必须排除这些行** —— 否则"等全部 594"永远等不到，
-  //      每个含 0 分行的合集都会白等 90/150s，然后被当成异常永久跳过（20 个就停整轮）。
+  // ========== 等待判错完成（"未判定"的有效行清零） ==========
+  // 模式2 的"等响应"：批量错误提交后，满足以下条件才算完成：
+  //   ① **有效行里不再有"未判定(状态码 0 或空)"的行**（有效行 = 得分非 0 且可读的行）
+  //      9.2.1/9.2.2 实测：批量错误**只会把"未判定(0)"的行改成 594**；
+  //        · 得分为 0 / 读不到的行 → 状态码不变
+  //        · 状态码 777（以及 601 等"前人已判定"的码）→ 状态码也不变
+  //      所以"等全部子样本 = 594"是永远等不到的（9.2.0 及以前因此会白等超时、把成功的合集
+  //      当成异常永久跳过；跳过满 20 个还会停整轮）。现在只等"待判行清零"。
   //   ② 页面转圈已结束（点确认后确认键旁/表格上会出现转圈，必须等它消失）
   //   ③ 若一条有效行都没有 → 系统不会产生任何 594，直接视为判错动作已完成（会打警告日志）
   // 8.0：等待期间第 30s / 60s 会各重试点击一次「批量错误」
@@ -995,12 +1017,12 @@
       expandedRow = resolveExpandedRow(R, expandedRow);   // 9.4.3：节点失效则重新定位
       const stats = getCodeStats(expandedRow);
       const loading = isLoading();
-      state.judgeNeed = stats.valid;                      // 9.2.1：按有效行计进度
-      state.judgeDone = stats.validWrong;
-      setStatus('模式2 · 判错处理中 594: ' + stats.validWrong + '/' + stats.valid +
-        (stats.valid === 0
-          ? ('　⚠️ 无有效行（' + stats.notReady + ' 条 0分/读不到，系统不会产生 594）')
-          : (stats.validWrong === stats.valid ? ' ✅' : ' ⏳ [' + stats.detail + ']')) +
+      // 展示用：有效行总数 / 其中已不再"待判"的条数（真正的完成条件是 pendingValid === 0）
+      state.judgeNeed = stats.valid;
+      state.judgeDone = Math.max(0, stats.valid - stats.pendingValid);
+      setStatus('模式2 · 判错处理中：待判(0) 还剩 ' + stats.pendingValid + ' 条' +
+        '（有效行 ' + stats.valid + ' 条，已594 ' + stats.validWrong +
+        '；0分/读不到 ' + stats.notReady + ' 条、777·601 等已判定行系统不会改）' +
         (loading ? '（系统处理中…）' : ''));
 
       if (!loading) {
@@ -1009,7 +1031,12 @@
             '系统不会产生 594，视为「批量错误」这一步已完成，继续走查询刷新');
           return true;
         }
-        if (stats.validWrong === stats.valid) return true;
+        if (stats.pendingValid === 0) {
+          log('✅ 判错完成判定：有效行里已无"未判定(0/空)"的行（有效行已594 ' + stats.validWrong +
+            ' 条；' + Math.max(0, stats.valid - stats.validWrong) +
+            ' 条是 777/601 等已判定行，系统不会改其状态码）');
+          return true;
+        }
       }
 
       await retryTick(start, retried, R, '批量错误', expandedRow, '（判错等待中）');
@@ -1150,7 +1177,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.2',
-      version: '9.2.1',
+      version: '9.2.2',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -1464,9 +1491,11 @@
       return { result: 'problem', mode: 2 };
     }
     setStatus('模式2 · 全选子样本 ' + stats.total + ' 条...');
-    log('模式2 当前状态码分布: ' + stats.detail + '（全部行已是594 ' + stats.wrong + ' 条，待处理 ' +
-      stats.notWrong + ' 条；其中**有效行** ' + stats.valid + ' 条，已594 ' + stats.validWrong +
-      ' 条；另有 ' + stats.notReady + ' 条 0分/读不到——系统不会改它们的状态码，不参与等待）');
+    log('模式2 当前状态码分布: ' + stats.detail + '（全部行已是594 ' + stats.wrong + ' 条；' +
+      '**有效行** ' + stats.valid + ' 条，其中"待判(0/空)"还剩 ' + stats.pendingValid +
+      ' 条 —— 判错完成就等它清零；另有 ' + stats.notReady + ' 条 0分/读不到、' +
+      (stats.valid - stats.validWrong - stats.pendingValid) +
+      ' 条 777/601 等已判定行，系统都不会改其状态码）');
     const checked = await selectAllChildRows(expandedRow);
     if (!state.running) return { result: 'problem', mode: 2 };
     log('已勾选 ' + checked + ' / ' + stats.total + ' 条');
@@ -1492,15 +1521,19 @@
     const ok = await waitAllJudged(expandedRow, R, judgeWait);
     if (!ok) {
       const last = getCodeStats(expandedRow);
-      log('等待594+加载完成超时(' + Math.round(judgeWait / 1000) + 's，已含30s/60s两次重试)：' +
-        '有效行已594 ' + last.validWrong + '/' + last.valid + '，状态码分布 ' + last.detail +
+      log('等待判错完成超时(' + Math.round(judgeWait / 1000) + 's，已含30s/60s两次重试)：' +
+        '有效行里"待判(0/空)"还剩 ' + last.pendingValid + ' 条（有效行 ' + last.valid +
+        ' 条，已594 ' + last.validWrong + '），状态码分布 ' + last.detail +
         (isLoading() ? '（页面仍有转圈）' : '') + '，判定该合集有问题');
-      return { result: 'problem', mode: 2, reason: '批量错误等待超时（有效行 594 未齐）' };
+      return { result: 'problem', mode: 2, reason: '批量错误等待超时（待判行未清零）' };
     }
-    log('✅ 判错完成：有效行状态码全部=' + CONFIG.wrongCode + '，且系统处理已结束' +
-      (getCodeStats(expandedRow).notReady > 0
-        ? ('（另有 ' + getCodeStats(expandedRow).notReady + ' 条 0分/读不到的行，系统未改其状态码，已忽略）')
-        : ''));
+    {
+      const after = getCodeStats(expandedRow);
+      const unchanged = Math.max(0, after.valid - after.validWrong);
+      log('✅ 判错完成：有效行里已无"待判(0/空)"的行，且系统处理已结束（有效行 ' + after.valid +
+        ' 条：594 ' + after.validWrong + ' 条，' + unchanged + ' 条为 777/601 等系统不会改的已判定行' +
+        (after.notReady > 0 ? ('；另有 ' + after.notReady + ' 条 0分/读不到已忽略') : '') + '）');
+    }
 
     // 判错成功后额外等待（落库缓冲）
     setStatus('判错成功，等待系统落库...');
