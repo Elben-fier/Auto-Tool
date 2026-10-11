@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.2】
 // @namespace    https://doubao.com/userscripts
-// @version      9.2.0
+// @version      9.2.1
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（关键词双列比对、母本最高分(第5列)<90）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含关键词双列比对（命中词第4列缺任一即全错）、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -70,6 +70,21 @@
 //  注意：9.4.2 那版的上报字段 version 漏改，日志里显示的是 9.4.1（9.4.3 起已跟随版本）。
 //  规则拆解：docs/短剧审核9.1判定机制详解.md ｜ 逐版本变更史：docs/版本演进记录.md
 //  注：9.2.2 仅把原先堆在这里的 164 行逐版变更记录并入上述文档，脚本代码未改动。
+// ==========================================================================
+// ============================== 9.2.1 系统更新：0 分行不会被改成 594（判错完成判定只认"有效行"） ==============================
+//  【系统更新（2026-10-11 实机）】批量错误之后，**"得分为 0/读不到"的行状态码不会变**
+//      （它们仍是原码，不会变成 594）。
+//  【影响】旧判据是"全部子样本 = 594 才算判错完成" → 只要合集里有 1 条 0 分行，
+//      这个条件**永远不可能满足** → 每个这样的合集都会白等 90/150s（还包含 30s/60s 两次重试），
+//      然后被当成"处理异常"**永久跳过**；跳过满 maxSkipCount(20) 个还会把整轮停掉。
+//      换句话说：全错判定其实已经提交成功了，脚本却以为失败。
+//  【本次】完成判定改为只看**有效行**（有效行 = 得分非 0 且可读的行）：
+//      · getCodeStats 新增 `validWrong`（有效行里已是 594 的条数）
+//      · waitAllJudged 用 "validWrong === valid && 无转圈" 判完成（进度条也按有效行显示）
+//      · 若**一条有效行都没有** → 系统不会产生任何 594，直接视为"批量错误这一步已完成"，
+//        并打印警告日志（继续走 查询刷新），不再白等
+//      · 日志/超时原因都改为按有效行口径，并注明有多少条 0 分行被忽略
+//  【不变】判定规则、展开核对、扫描与结束、预演、慢处理等全部不动。
 // ==========================================================================
 // ============================== 9.2.0 页面改版适配（子表新增一列）+ 收尾收起全部母本行 ==============================
 //  【页面变化】展开合集后，子样本表在**第3列插入了 episode-index**，原来的状态码(hide-flag)
@@ -586,8 +601,10 @@
 
   // 汇总当前展开子表：状态码分布 + 各 judgeCode(777/601) 条数 + 得分分层
   // 9.1.1：展开判定用"777 或 601 的条数（各自计数）"，故这里统计 judgeCounts
-  // 9.3.0：得分 = 0 或读不到的行走 =「这条还没刷新出来」→ 不计入 base/低分/高分/正确数据；
-  //         但 594 进度（wrong/notWrong）与判定码计数仍按全部行统计，避免影响"等全部594"的判定。
+  // 9.3.0：得分 = 0 或读不到的行走 =「这条还没刷新出来」→ 不计入 base/低分/高分/正确数据
+  // 9.2.1：**系统对"得分为 0/读不到"的行不会改状态码**（实测：批量错误后这些行仍是原码）
+  //        → 因此另外统计 validWrong（"有效行"里已是 594 的条数），供"判错完成"判定使用；
+  //          wrong/notWrong 仍按全部行统计，只用于日志展示。
   function getCodeStats(expandedRow) {
     const rows = getChildRows(expandedRow);
     const counters = {};
@@ -597,6 +614,7 @@
     let scoreLow = 0;           // 9.3.0：0 < 得分 < lowScoreThreshold(80) 的条数
     let notReady = 0;           // 9.3.0：得分 = 0 或读不到 → 视为还没刷新，不计入判定统计
     let correct = 0;            // 9.3.0：正确数据行数（判定码 777/601 或 高分；同一行只算一次）
+    let validWrong = 0;         // 9.2.1：**有效行**里状态码已是 594 的条数（判错完成判定用）
     const judgeCounts = {};     // 9.1.1：各 judgeCode 的子样本条数，如 {777: 5, 601: 0}
     CONFIG.judgeCodes.forEach((c) => { judgeCounts[c] = 0; });
     rows.forEach((row) => {
@@ -618,6 +636,7 @@
       if (notReadyRow) { notReady++; return; }         // 分数相关统计（有效行/低分/高分）不含该行
 
       scoreKnown++;
+      if (code === CONFIG.wrongCode) validWrong++;     // 9.2.1：只数"有效行"的 594
       if (isHigh) scoreHigh++;
       else if (sc < CONFIG.lowScoreThreshold) scoreLow++;
     });
@@ -631,8 +650,9 @@
       valid: validRows,                  // 9.3.0：有效行数（不含 0 分/读不到）
       notReady: notReady,                // 9.3.0：0 分/读不到的行数
       unjudged: unjudged,
-      wrong: wrongCount,                 // 已是 594 的行数（全部行，含没刷新的）
-      notWrong: rows.length - wrongCount, // 还不是 594 的行数（等"全部594"按全部行算）
+      wrong: wrongCount,                 // 已是 594 的行数（全部行，含没刷新的；仅用于日志展示）
+      notWrong: rows.length - wrongCount, // 还不是 594 的行数（全部行；仅用于日志展示）
+      validWrong: validWrong,            // 9.2.1：有效行里已是 594 的条数（判错完成判定用）
       counters: counters,
       detail: detail,
       judgeCounts: judgeCounts,          // 各 judgeCode 的条数
@@ -958,10 +978,14 @@
   }
 
   // ========== 等待全部子样本变成 594（判错完成） ==========
-  // 模式2 的"等响应"：批量错误提交后，必须满足三个条件才算完成：
-  //   ① 所有子样本状态码都是 594（不能只看"不再是0"，否则原有 777/601 会误判为完成）
+  // 模式2 的"等响应"：批量错误提交后，必须满足才算完成：
+  //   ① **有效行**的状态码都是 594（有效行 = 得分非 0 且可读的行）
+  //      9.2.1 实测：系统对"得分为 0/读不到"的行**不会改状态码**（批量错误后它们仍是原码），
+  //      所以完成判定**必须排除这些行** —— 否则"等全部 594"永远等不到，
+  //      每个含 0 分行的合集都会白等 90/150s，然后被当成异常永久跳过（20 个就停整轮）。
   //   ② 页面转圈已结束（点确认后确认键旁/表格上会出现转圈，必须等它消失）
-  //   8.0：等待期间第 30s / 60s 会各重试点击一次「批量错误」
+  //   ③ 若一条有效行都没有 → 系统不会产生任何 594，直接视为判错动作已完成（会打警告日志）
+  // 8.0：等待期间第 30s / 60s 会各重试点击一次「批量错误」
   async function waitAllJudged(expandedRow, R, timeout) {
     const start = Date.now();
     const retried = [];
@@ -971,13 +995,22 @@
       expandedRow = resolveExpandedRow(R, expandedRow);   // 9.4.3：节点失效则重新定位
       const stats = getCodeStats(expandedRow);
       const loading = isLoading();
-      state.judgeNeed = stats.total;
-      state.judgeDone = stats.wrong;
-      setStatus('模式2 · 判错处理中 594: ' + stats.wrong + '/' + stats.total +
-        (stats.notWrong === 0 ? ' ✅' : ' ⏳ [' + stats.detail + ']') +
+      state.judgeNeed = stats.valid;                      // 9.2.1：按有效行计进度
+      state.judgeDone = stats.validWrong;
+      setStatus('模式2 · 判错处理中 594: ' + stats.validWrong + '/' + stats.valid +
+        (stats.valid === 0
+          ? ('　⚠️ 无有效行（' + stats.notReady + ' 条 0分/读不到，系统不会产生 594）')
+          : (stats.validWrong === stats.valid ? ' ✅' : ' ⏳ [' + stats.detail + ']')) +
         (loading ? '（系统处理中…）' : ''));
 
-      if (stats.total > 0 && stats.wrong === stats.total && !loading) return true;
+      if (!loading) {
+        if (stats.valid === 0) {
+          log('⚠️ 该合集没有有效行（' + stats.notReady + ' 条全是 0 分/读不到）→ ' +
+            '系统不会产生 594，视为「批量错误」这一步已完成，继续走查询刷新');
+          return true;
+        }
+        if (stats.validWrong === stats.valid) return true;
+      }
 
       await retryTick(start, retried, R, '批量错误', expandedRow, '（判错等待中）');
       await delay(CONFIG.checkInterval);
@@ -1117,7 +1150,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.2',
-      version: '9.2.0',
+      version: '9.2.1',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -1431,7 +1464,9 @@
       return { result: 'problem', mode: 2 };
     }
     setStatus('模式2 · 全选子样本 ' + stats.total + ' 条...');
-    log('模式2 当前状态码分布: ' + stats.detail + '（已是594 ' + stats.wrong + ' 条，待处理 ' + stats.notWrong + ' 条）');
+    log('模式2 当前状态码分布: ' + stats.detail + '（全部行已是594 ' + stats.wrong + ' 条，待处理 ' +
+      stats.notWrong + ' 条；其中**有效行** ' + stats.valid + ' 条，已594 ' + stats.validWrong +
+      ' 条；另有 ' + stats.notReady + ' 条 0分/读不到——系统不会改它们的状态码，不参与等待）');
     const checked = await selectAllChildRows(expandedRow);
     if (!state.running) return { result: 'problem', mode: 2 };
     log('已勾选 ' + checked + ' / ' + stats.total + ' 条');
@@ -1451,16 +1486,21 @@
       return { result: 'problem', mode: 2 };
     }
 
-    // 等响应：所有子样本变 594 且转圈结束；等待期间 30s/60s 会重试点击「批量错误」
+    // 等响应：**有效行**都变 594 且转圈结束（0分/读不到的行系统不改状态码，不等待）；
+    //   等待期间 30s/60s 会重试点击「批量错误」
     const judgeWait = meta.isSlow ? CONFIG.batchErrorWaitMaxSlow : CONFIG.batchErrorWaitMax;
     const ok = await waitAllJudged(expandedRow, R, judgeWait);
     if (!ok) {
       const last = getCodeStats(expandedRow);
-      log('等待594+加载完成超时(' + Math.round(judgeWait / 1000) + 's，已含30s/60s两次重试)，状态码分布: ' +
-        last.detail + (isLoading() ? '（页面仍有转圈）' : '') + '，判定该合集有问题');
-      return { result: 'problem', mode: 2, reason: '批量错误等待超时（594未齐）' };
+      log('等待594+加载完成超时(' + Math.round(judgeWait / 1000) + 's，已含30s/60s两次重试)：' +
+        '有效行已594 ' + last.validWrong + '/' + last.valid + '，状态码分布 ' + last.detail +
+        (isLoading() ? '（页面仍有转圈）' : '') + '，判定该合集有问题');
+      return { result: 'problem', mode: 2, reason: '批量错误等待超时（有效行 594 未齐）' };
     }
-    log('✅ 判错完成：全部子样本状态码=' + CONFIG.wrongCode + '，且系统处理已结束');
+    log('✅ 判错完成：有效行状态码全部=' + CONFIG.wrongCode + '，且系统处理已结束' +
+      (getCodeStats(expandedRow).notReady > 0
+        ? ('（另有 ' + getCodeStats(expandedRow).notReady + ' 条 0分/读不到的行，系统未改其状态码，已忽略）')
+        : ''));
 
     // 判错成功后额外等待（落库缓冲）
     setStatus('判错成功，等待系统落库...');
