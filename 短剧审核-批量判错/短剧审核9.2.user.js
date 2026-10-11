@@ -185,9 +185,10 @@
     childSelectAll: '.ant-pro-table thead th:first-child input.ant-checkbox-input',
     childRow: '.ant-pro-table tbody tr.ant-table-row',
     childCheckbox: 'td:first-child input.ant-checkbox-input',
-    childCodeCell: 'td:nth-child(4)',    // 子样本状态码（9.2.0：页面在第3列插入了 episode-index，状态码/hide-flag 移到第4列）
+    childCodeCell: 'td:nth-child(4)',    // 子样本状态码（9.2.0 页面改版：第3列插入 episode-index → 状态码/hide-flag 移到第4列；**已确认真机列序**）
+    //  ↑ 若以后又改版：看面板日志「🔎 子表列结构自检」或控制台 [自检] 三行，调整这里的列号即可
                                         //   取值：0=未判定 594=判错完成 777/601=前人已判定(有正确数据)
-    childScoreCell: 'td:nth-child(9)',   // 子样本单条分（9.2.0：第3列插入新列后整体右移一位，8 → 9）
+    childScoreCell: 'td:nth-child(9)',   // 子样本单条分（9.2.0：第3列插入新列后整体右移一位 8 → 9；**已确认真机列序**）
     childIdCell: 'td:nth-child(2)',      // 9.1.5：子样本第一条的 id（上报判定日志用；按要求不用母本id）
   };
 
@@ -785,8 +786,10 @@
     return n;
   }
 
-  // ========== 9.2.0：子表列结构自检 ==========
-  // 页面在子表第3列插入了 episode-index，状态码/得分列都右移了一位（3→4、8→9）。
+  // ========== 9.2.0：子表列结构自检（列号已确认，现在的作用是"改版预警"） ==========
+  // 2026-10-11 页面改版在子表第3列插入了 episode-index → 状态码 3→4、单条分 8→9（**已确认真机列序**）。
+  // 这段自检留着的意义：页面**再次**改版时，能立刻从日志/控制台看出"列号对不上了"，
+  // 而不是静默读错列去判错 —— 每轮只打印一次，对性能无影响。
   // 这里在每轮第一次展开时，把列头与首行各列文本打到控制台，方便一眼核对列号是否还对得上。
   let childDumpDone = false;
   function dumpChildColumns(expandedRow) {
