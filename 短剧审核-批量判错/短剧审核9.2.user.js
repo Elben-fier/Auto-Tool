@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.2】
 // @namespace    https://doubao.com/userscripts
-// @version      9.2.2
+// @version      9.2.3
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（关键词双列比对、母本最高分(第5列)<90）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含关键词双列比对（命中词第4列缺任一即全错）、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
 // @grant        GM_setClipboard
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      127.0.0.1
 // @connect      localhost
 // @run-at       document-end
@@ -71,7 +72,23 @@
 //  规则拆解：docs/短剧审核9.1判定机制详解.md ｜ 逐版本变更史：docs/版本演进记录.md
 //  注：9.2.2 仅把原先堆在这里的 164 行逐版变更记录并入上述文档，脚本代码未改动。
 // ==========================================================================
-// ============================== 9.2.2 系统更新补充：777 也不会被改成 594 → 判错完成只等"待判行清零" ==============================
+// ============================== 9.2.3 「批量错误提交成功」改为多路信号（不再只看状态码） ==============================
+//  【背景】"等子样本变 594"本来的目的只是**确认「批量错误」这次提交真的成功了**；但平台更新后
+//      "哪些状态码会变、哪些不变"并不确定（已知 0 分行不变、777/601 不变，其它码未知），
+//      继续拿状态码当唯一判据很脆弱。
+//  【做法】四路信号，命中任一（且当前无转圈）即视为提交成功，并写明是哪一路命中的：
+//      ① 网络：观察到点击后页面真的发出了 2xx 的提交请求（POST/PUT/PATCH）→ 最直接可靠
+//      ② 状态码：有效行里"未判定(0/空)"清零（平台行为允许时的老判据）
+//      ③ 勾选：点击前有勾选、现在被平台清空了（成功提交后通常会自动清勾选）
+//      ④ 转圈：点击后转圈"出现过"且现在已消失（证明真的触发了异步操作）
+//      ②是状态码判据，①③④都与状态码无关 —— 平台再改规则也不影响。
+//  【权限】①需要新增 `@grant unsafeWindow` 才能挂到页面自己的 XHR/fetch 上；挂不上会自动退化，
+//      并在控制台打印"[网络观察] 安装失败"。
+//  【观测辅助】第一次判错成功后会打印"本次点击后的请求清单"；若超时，会打印四路信号的状态 +
+//      最近请求 —— 把这两行发出来就能确认"批量错误"到底打的是哪个接口，之后可把①收紧成精确匹配。
+//  【不变】判定规则、展开核对、扫描与结束、预演、慢处理等全部不动。
+// ==========================================================================
+// ============================== 9.2.2 系统更新补充：777 也不会被改成 594（判据随后被 9.2.3 取代） ==============================
 //  【系统更新（2026-10-11 实机补充）】批量错误**只会把"未判定(状态码 0/空)"的行改成 594**；
 //      下面这两类行**状态码不会变**：
 //        · 得分为 0 / 读不到的行（原码保留）
@@ -84,6 +101,7 @@
 //        `validWrong`/`wrong`/`notWrong` 全部退化为日志与进度展示
 //      · 状态栏/日志改为显示"待判(0) 还剩 N 条"，并注明 0分行与 777·601 行不参与等待
 //      · 一条有效行都没有时仍然直接视为这一步完成（打警告日志）
+//      ⚠️ 9.2.3 起：状态码只是四路信号之一，另外三路（网络/勾选/转圈）与状态码无关
 //  【不变】判定规则、展开核对、扫描与结束、预演、慢处理等全部不动。
 // ==========================================================================
 // ============================== 9.2.1 系统更新：0 分行不会被改成 594（第一版尝试，已被 9.2.2 取代） ==============================
@@ -1008,33 +1026,179 @@
   //   ② 页面转圈已结束（点确认后确认键旁/表格上会出现转圈，必须等它消失）
   //   ③ 若一条有效行都没有 → 系统不会产生任何 594，直接视为判错动作已完成（会打警告日志）
   // 8.0：等待期间第 30s / 60s 会各重试点击一次「批量错误」
-  async function waitAllJudged(expandedRow, R, timeout) {
+  // ========== 9.2.3：不依赖状态码的「提交成功」多路信号 ==========
+  //  【背景】"等子样本变成 594"原本只是为了**确认「批量错误」这次提交真的成功了**；
+  //     但平台更新后"哪些状态码会变、哪些不变"并不确定（已知：0分行不变、777/601 不变，
+  //     其它码未知），继续拿状态码当唯一判据会很脆弱。
+  //  【做法】改用四路信号，命中任一（且当前无转圈）即视为提交成功，并写明是哪一路命中的：
+  //     ① **网络**：观察到点击后页面真的发出了 2xx 的提交请求（POST/PUT/PATCH）—— 最直接、最可靠；
+  //     ② **状态码**：有效行里"未判定(0/空)"清零（平台行为允许时的老判据）；
+  //     ③ **勾选**：点击前有勾选、现在被平台清空了（成功提交后通常会自动清勾选）；
+  //     ④ **转圈**：点击后转圈"出现过"且现在已消失（证明真的触发了异步操作）。
+  //     ②是状态码判据，①③④都与状态码无关 —— 平台再改规则也不影响。
+  //  【权限】①需要 `@grant unsafeWindow` 才能挂到页面自己的 XHR/fetch 上；挂不上就自动退化。
+  const netLog = [];            // 最近 40 条：{t, method, url, status, ms}
+  let netHookInstalled = false;
+  let sawLoadingAt = 0;         // 观察到转圈的时间（0 = 本次还没见过）
+  let netDumpedOnce = false;    // 第一次判错后把请求清单打一次，便于核对是哪条接口
+
+  function pushNet(rec) {
+    try {
+      rec.url = String(rec.url || '').slice(0, 160);
+      netLog.push(rec);
+      if (netLog.length > 40) netLog.shift();
+    } catch (e) { /* 忽略 */ }
+  }
+
+  // 挂 XHR / fetch 观察钩子（只记录，绝不改变请求行为）
+  function installNetHook() {
+    if (netHookInstalled) return;
+    const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+    try {
+      const XO = W.XMLHttpRequest;
+      if (XO && XO.prototype && XO.prototype.open && XO.prototype.send) {
+        const rawOpen = XO.prototype.open;
+        const rawSend = XO.prototype.send;
+        XO.prototype.open = function (method, url) {
+          try { this.__dsh9 = { t: Date.now(), method: String(method || '').toUpperCase(), url: String(url || '') }; }
+          catch (e) { /* 忽略 */ }
+          return rawOpen.apply(this, arguments);
+        };
+        XO.prototype.send = function (body) {
+          try {
+            const rec = this.__dsh9;
+            if (rec) {
+              rec.body = (typeof body === 'string') ? body.slice(0, 200) : '';
+              this.addEventListener('loadend', () => {
+                rec.status = this.status;
+                rec.ms = Date.now() - rec.t;
+                pushNet(rec);
+              });
+            }
+          } catch (e) { /* 忽略 */ }
+          return rawSend.apply(this, arguments);
+        };
+        netHookInstalled = true;
+      }
+      const rawFetch = W.fetch;
+      if (typeof rawFetch === 'function') {
+        W.fetch = function (input, init) {
+          const t = Date.now();
+          const url = (input && input.url) ? input.url : String(input || '');
+          const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+          return rawFetch.apply(this, arguments).then((res) => {
+            pushNet({ t: t, method: method, url: url, status: res.status, ms: Date.now() - t });
+            return res;
+          });
+        };
+        netHookInstalled = true;
+      }
+      console.log('[自检] 网络观察钩子已安装（' + (netHookInstalled ? 'XHR/fetch' : '未成功') +
+        '）→ 用于确认「批量错误」是否真的提交成功');
+    } catch (e) {
+      console.warn('[网络观察] 安装失败（可能缺 unsafeWindow 权限）：', e && e.message);
+    }
+  }
+
+  // 点击之后是否出现过 2xx 的提交请求
+  function recentSubmit(t0) {
+    for (let i = netLog.length - 1; i >= 0; i--) {
+      const r = netLog[i];
+      if (r.t >= t0 && r.status >= 200 && r.status < 300 && /^(POST|PUT|PATCH)$/i.test(r.method)) return r;
+    }
+    return null;
+  }
+
+  function netTail(n) {
+    return netLog.slice(-n).map((r) => r.method + ' ' + r.url + ' → ' + r.status + ' (' + r.ms + 'ms)').join(' | ');
+  }
+
+  // 勾选数量（用于"平台是否把勾选清空了"这一路信号）
+  function countCheckedChildRows(expandedRow) {
+    let n = 0;
+    getChildRows(expandedRow).forEach((row) => {
+      const cb = row.querySelector(SELECTORS.childCheckbox);
+      if (cb && cb.checked) n++;
+    });
+    return n;
+  }
+
+  // 观察"转圈是否出现过"（点击后可能出现、很快消失，500ms 轮询可能漏掉）
+  let loadingObserver = null;
+  function startLoadingWatch() {
+    if (loadingObserver) return;
+    try {
+      loadingObserver = new MutationObserver(() => {
+        // 性能：已经记过就直接返回；且只做一次便宜的 querySelector，不跑完整的 isLoading()
+        if (sawLoadingAt) return;
+        try {
+          if (document.querySelector('button.ant-btn-loading, .ant-spin-spinning, .ant-spin-dot-spin')) {
+            sawLoadingAt = Date.now();
+          }
+        } catch (e) { /* 忽略 */ }
+      });
+      loadingObserver.observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+    } catch (e) { loadingObserver = null; }
+  }
+
+  async function waitAllJudged(expandedRow, R, timeout, ctx) {
     const start = Date.now();
     const retried = [];
+    const clickT0 = (ctx && ctx.clickT0) || start;              // 点「批量错误」的时刻
+    const checkedBefore = (ctx && ctx.checkedBefore) || 0;      // 点击前的勾选数
+    const minSettleMs = 1200;                                   // ③④两路信号要求的最小等待，避免误判
     while (Date.now() - start < timeout) {
       if (!state.running) return false;
 
       expandedRow = resolveExpandedRow(R, expandedRow);   // 9.4.3：节点失效则重新定位
       const stats = getCodeStats(expandedRow);
       const loading = isLoading();
-      // 展示用：有效行总数 / 其中已不再"待判"的条数（真正的完成条件是 pendingValid === 0）
+      // 9.2.3：四路信号（与状态码无关的三路 + 状态码一路）
+      const net = recentSubmit(clickT0);
+      const checkedNow = countCheckedChildRows(expandedRow);
+      const selCleared = checkedBefore > 0 && checkedNow === 0;
+      const calmedAfterLoading = sawLoadingAt >= clickT0 && !loading;
+      // 展示用
       state.judgeNeed = stats.valid;
       state.judgeDone = Math.max(0, stats.valid - stats.pendingValid);
-      setStatus('模式2 · 判错处理中：待判(0) 还剩 ' + stats.pendingValid + ' 条' +
-        '（有效行 ' + stats.valid + ' 条，已594 ' + stats.validWrong +
-        '；0分/读不到 ' + stats.notReady + ' 条、777·601 等已判定行系统不会改）' +
+      setStatus('模式2 · 判错处理中：待判(0) ' + stats.pendingValid + ' 条' +
+        '｜信号 网络' + (net ? '✓' : '…') + ' 待判' + (stats.pendingValid === 0 ? '✓' : '…') +
+        ' 勾选' + (selCleared ? '✓' : '…') + ' 转圈' + (calmedAfterLoading ? '✓' : '…') +
         (loading ? '（系统处理中…）' : ''));
 
       if (!loading) {
+        // ① 网络：观察到点击后真的发出了 2xx 提交请求 → 最可靠，直接判定提交成功
+        if (net) {
+          log('📡 观察到提交请求成功：' + net.method + ' ' + net.url + ' → HTTP ' + net.status +
+            '（' + net.ms + 'ms）→ 判定「批量错误」已提交成功（**不再依赖状态码**）');
+          if (!netDumpedOnce) {
+            netDumpedOnce = true;
+            log('📡 本次点击后的请求清单（便于核对是哪条接口）：' + netTail(8));
+          }
+          return true;
+        }
+        // ② 状态码：有效行里"未判定(0/空)"清零（平台允许时的老判据）
         if (stats.valid === 0) {
           log('⚠️ 该合集没有有效行（' + stats.notReady + ' 条全是 0 分/读不到）→ ' +
-            '系统不会产生 594，视为「批量错误」这一步已完成，继续走查询刷新');
+            '视为「批量错误」这一步已完成，继续走查询刷新');
           return true;
         }
         if (stats.pendingValid === 0) {
           log('✅ 判错完成判定：有效行里已无"未判定(0/空)"的行（有效行已594 ' + stats.validWrong +
             ' 条；' + Math.max(0, stats.valid - stats.validWrong) +
             ' 条是 777/601 等已判定行，系统不会改其状态码）');
+          return true;
+        }
+        // ③ 勾选被平台清空 → 成功提交后的常见表现（与状态码无关）
+        if (selCleared && Date.now() - start > minSettleMs) {
+          log('✅ 点击前的 ' + checkedBefore + ' 条勾选已被平台清空 → 判定「批量错误」已提交成功' +
+            '（不依赖状态码；待判(0) 还剩 ' + stats.pendingValid + ' 条）');
+          return true;
+        }
+        // ④ 点击后转圈出现过并已结束 → 说明确实触发了异步提交（与状态码无关）
+        if (calmedAfterLoading && Date.now() - start > minSettleMs) {
+          log('✅ 点击后页面转圈出现过并已结束 → 判定「批量错误」已提交成功' +
+            '（不依赖状态码；待判(0) 还剩 ' + stats.pendingValid + ' 条）');
           return true;
         }
       }
@@ -1177,7 +1341,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.2',
-      version: '9.2.2',
+      version: '9.2.3',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -1510,29 +1674,37 @@
 
     // 批量错误（判错）——失败自动重试3次
     log('点击「批量错误」...');
+    installNetHook();            // 9.2.3：确保网络观察钩子已装（用于确认提交成功）
+    startLoadingWatch();         // 9.2.3：确保"转圈是否出现过"的观察已开
+    sawLoadingAt = 0;            // 9.2.3：重置"见过转圈"标记（观察器记过就不再检查，必须每次点击前清掉）
+    const clickT0 = Date.now();
     if (!(await clickRowButtonRetry(R, '批量错误', expandedRow, 3, 3000))) {
       log('批量错误提交失败（按钮不可用或弹窗未出现）');
       return { result: 'problem', mode: 2 };
     }
 
-    // 等响应：**有效行**都变 594 且转圈结束（0分/读不到的行系统不改状态码，不等待）；
+    // 等响应：四路信号任一命中即算提交成功（网络 2xx / 待判(0)清零 / 勾选被清空 / 转圈出现过并结束）
     //   等待期间 30s/60s 会重试点击「批量错误」
     const judgeWait = meta.isSlow ? CONFIG.batchErrorWaitMaxSlow : CONFIG.batchErrorWaitMax;
-    const ok = await waitAllJudged(expandedRow, R, judgeWait);
+    const ok = await waitAllJudged(expandedRow, R, judgeWait, { clickT0: clickT0, checkedBefore: checked });
     if (!ok) {
       const last = getCodeStats(expandedRow);
       log('等待判错完成超时(' + Math.round(judgeWait / 1000) + 's，已含30s/60s两次重试)：' +
         '有效行里"待判(0/空)"还剩 ' + last.pendingValid + ' 条（有效行 ' + last.valid +
         ' 条，已594 ' + last.validWrong + '），状态码分布 ' + last.detail +
         (isLoading() ? '（页面仍有转圈）' : '') + '，判定该合集有问题');
-      return { result: 'problem', mode: 2, reason: '批量错误等待超时（待判行未清零）' };
+      log('🔍 超时诊断：网络信号=' + (recentSubmit(clickT0) ? '有' : '无') +
+        '｜勾选现在剩 ' + countCheckedChildRows(expandedRow) + ' 条（点击前 ' + checked + ' 条）' +
+        '｜转圈观察=' + (sawLoadingAt >= clickT0 ? '点后出现过' : '点后没见到'));
+      log('📡 最近请求（点后）：' + (netTail(8) || '（没抓到任何请求——钩子可能没装上，看控制台自检）'));
+      return { result: 'problem', mode: 2, reason: '批量错误等待超时（四路信号都没命中）' };
     }
     {
       const after = getCodeStats(expandedRow);
       const unchanged = Math.max(0, after.valid - after.validWrong);
-      log('✅ 判错完成：有效行里已无"待判(0/空)"的行，且系统处理已结束（有效行 ' + after.valid +
-        ' 条：594 ' + after.validWrong + ' 条，' + unchanged + ' 条为 777/601 等系统不会改的已判定行' +
-        (after.notReady > 0 ? ('；另有 ' + after.notReady + ' 条 0分/读不到已忽略') : '') + '）');
+      log('✅ 批量错误这一步完成，继续查询刷新（当前：有效行 ' + after.valid + ' 条 / 594 ' +
+        after.validWrong + ' 条 / ' + unchanged + ' 条为 777/601 等系统不会改的已判定行' +
+        (after.notReady > 0 ? ('；' + after.notReady + ' 条 0分/读不到') : '') + '）');
     }
 
     // 判错成功后额外等待（落库缓冲）
