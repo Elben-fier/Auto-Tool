@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shift短剧审核-相似度矩阵版【9.2】
 // @namespace    https://doubao.com/userscripts
-// @version      9.2.3
+// @version      9.2.4
 // @description  判定结果可上报本地后端日志（POST /judge_log，记录子样本第一条id与判定原因）；除硬规则（关键词双列比对、母本最高分(第5列)<90）外一律展开核对（子样本得分0=没刷新出来，不计入统计）：低分(<80)条数 > 正确数据条数 → 全错；否则 得分≥93 的条数≥4 或 状态码777/601达标（有效行≤30条的小合集≥2、大合集≥4）→ 全剧审核，都不满足 → 全选+批量错误后点「查询」刷新；含关键词双列比对（命中词第4列缺任一即全错）、30s/60s重试、永久跳过、严格等待加载、慢处理档位与预演模式
 // @author       Doubao
 // @match        https://tools.vobile.cn/quality/dramaReview*
@@ -72,10 +72,23 @@
 //  规则拆解：docs/短剧审核9.1判定机制详解.md ｜ 逐版本变更史：docs/版本演进记录.md
 //  注：9.2.2 仅把原先堆在这里的 164 行逐版变更记录并入上述文档，脚本代码未改动。
 // ==========================================================================
-// ============================== 9.2.3 「批量错误提交成功」改为多路信号（不再只看状态码） ==============================
+// ============================== 9.2.4 判错成功【主判据】= 勾选被平台清空（用户指定） ==============================
+//  【需求】"③ 勾选被清空 —— 就用这个方式"。
+//  【实现】主判据只认 ③：**点击前勾选 N 条（N>0），点击后被平台清成 0 条** → 判定「批量错误」提交成功。
+//      · 状态码**完全不参与**判定（0 分行/777/601 变不变都无所谓）
+//      · 有 1.2s 最小等待，避免"勾选被 UI 顺手清掉"这类误判
+//      · 状态栏直接显示"勾选 12/42（宽限 8s 内只等它）"
+//  【兜底（保险，正常不会用到）】宽限期（普通 10s / 慢合集 20s，CONFIG.selClearGraceMs[Slow]）内
+//      只等 ③；过了宽限期才依次尝试 网络 2xx 提交 / 待判(0)清零 / 转圈出现过，
+//      并且**日志会明确写"【兜底·xx】未见勾选被清空"**，方便我们看出平台到底有没有清勾选。
+//      为什么保留兜底：若平台某次不清勾选，只用 ③ 会白等 90/150s 超时 → 把**已经判错成功**的合集
+//      当成异常永久跳过（跳过满 20 个还停整轮）——这正是 9.2.0 踩过的坑，不能再来一次。
+//  【诊断】超时会打印"勾选现在剩几条（点击前几条）→ 平台始终没清勾选" + 三个兜底信号的状态。
+//  【不变】判定规则、展开核对、扫描与结束、预演、慢处理等全部不动。
+// ==========================================================================
+// ============================== 9.2.3 判错成功引入多路信号（9.2.4 起只把 ③ 当主判据） ==============================
 //  【背景】"等子样本变 594"本来的目的只是**确认「批量错误」这次提交真的成功了**；但平台更新后
-//      "哪些状态码会变、哪些不变"并不确定（已知 0 分行不变、777/601 不变，其它码未知），
-//      继续拿状态码当唯一判据很脆弱。
+//      "哪些状态码会变、哪些不变"并不确定（已知 0 分行不变、777/601 不变，其它码未知）。
 //  【做法】四路信号，命中任一（且当前无转圈）即视为提交成功，并写明是哪一路命中的：
 //      ① 网络：观察到点击后页面真的发出了 2xx 的提交请求（POST/PUT/PATCH）→ 最直接可靠
 //      ② 状态码：有效行里"未判定(0/空)"清零（平台行为允许时的老判据）
@@ -210,6 +223,11 @@
     afterProblemDelay: 2000,       // 跳过合集后等待再继续
     maxSkipCount: 20,              // 最多跳过多少个合集（安全上限，超过则停止提示人工）
     maxErrTriesPerRow: 3,          // 9.4.4：同一合集连续抛异常多少次就永久跳过（防止原地重试不前进）
+    // 9.2.4：判错成功【主判据】=「点击前的勾选被平台清空」；这段时间内只等它，
+    //   过了宽限期才启用兜底信号（网络 2xx / 待判清零 / 转圈出现过），
+    //   避免平台某次不清勾选时白等超时、把成功的合集误判成异常永久跳过。
+    selClearGraceMs: 10000,        // 普通合集：宽限 10s
+    selClearGraceMsSlow: 20000,    // 慢处理合集（集数 > slowEpisodeThreshold）：宽限 20s
   };
 
   // ========== 运行状态 ==========
@@ -1146,66 +1164,79 @@
     const retried = [];
     const clickT0 = (ctx && ctx.clickT0) || start;              // 点「批量错误」的时刻
     const checkedBefore = (ctx && ctx.checkedBefore) || 0;      // 点击前的勾选数
-    const minSettleMs = 1200;                                   // ③④两路信号要求的最小等待，避免误判
+    const minSettleMs = 1200;                                   // 主判据的最小等待，防"勾选被 UI 顺手清掉"误判
+    // 9.2.4：主判据 = ③「勾选被平台清空」（用户指定）；宽限期内只认它，
+    //   过了宽限期才启用兜底信号（网络 2xx / 待判清零 / 转圈出现过）——
+    //   目的是"绝不因为平台某次没清勾选就白等超时、把成功的合集当异常永久跳过"。
+    const graceMs = (ctx && ctx.graceMs) || CONFIG.selClearGraceMs;
+    let fellBackTo = '';
     while (Date.now() - start < timeout) {
       if (!state.running) return false;
 
       expandedRow = resolveExpandedRow(R, expandedRow);   // 9.4.3：节点失效则重新定位
       const stats = getCodeStats(expandedRow);
       const loading = isLoading();
-      // 9.2.3：四路信号（与状态码无关的三路 + 状态码一路）
-      const net = recentSubmit(clickT0);
-      const checkedNow = countCheckedChildRows(expandedRow);
+      const elapsed = Date.now() - clickT0;
+      const net = recentSubmit(clickT0);                        // ① 网络：点击后有 2xx 提交请求
+      const checkedNow = countCheckedChildRows(expandedRow);    // ③ 勾选是否被平台清空
+      const headCb = expandedRow ? expandedRow.querySelector(SELECTORS.childSelectAll) : null;
+      const headChecked = !!(headCb && headCb.checked);         // 表头"全选"框状态（仅用于诊断）
       const selCleared = checkedBefore > 0 && checkedNow === 0;
-      const calmedAfterLoading = sawLoadingAt >= clickT0 && !loading;
+      const calmedAfterLoading = sawLoadingAt >= clickT0 && !loading;   // ④ 转圈出现过并结束
+      const inGrace = elapsed <= graceMs;
       // 展示用
       state.judgeNeed = stats.valid;
-      state.judgeDone = Math.max(0, stats.valid - stats.pendingValid);
-      setStatus('模式2 · 判错处理中：待判(0) ' + stats.pendingValid + ' 条' +
-        '｜信号 网络' + (net ? '✓' : '…') + ' 待判' + (stats.pendingValid === 0 ? '✓' : '…') +
-        ' 勾选' + (selCleared ? '✓' : '…') + ' 转圈' + (calmedAfterLoading ? '✓' : '…') +
+      state.judgeDone = Math.max(0, stats.valid - stats.validWrong);
+      setStatus('模式2 · 判错处理中（主判据：勾选被清空）：勾选 ' + checkedNow + '/' + checkedBefore +
+        (headChecked ? '（表头全选还勾着）' : '（表头全选已取消）') +
+        (inGrace ? '（宽限 ' + Math.ceil((graceMs - elapsed) / 1000) + 's 内只等它）'
+                 : '｜兜底：网络' + (net ? '✓' : '…') + ' 待判' + (stats.pendingValid === 0 ? '✓' : '…') +
+                   ' 转圈' + (calmedAfterLoading ? '✓' : '…')) +
         (loading ? '（系统处理中…）' : ''));
 
       if (!loading) {
-        // ① 网络：观察到点击后真的发出了 2xx 提交请求 → 最可靠，直接判定提交成功
-        if (net) {
-          log('📡 观察到提交请求成功：' + net.method + ' ' + net.url + ' → HTTP ' + net.status +
-            '（' + net.ms + 'ms）→ 判定「批量错误」已提交成功（**不再依赖状态码**）');
-          if (!netDumpedOnce) {
-            netDumpedOnce = true;
-            log('📡 本次点击后的请求清单（便于核对是哪条接口）：' + netTail(8));
+        // ===== 主判据 ③：点击前的勾选已被平台清空 → 判定「批量错误」提交成功 =====
+        if (selCleared && elapsed > minSettleMs) {
+          log('✅【主判据·勾选被清空】点击前的 ' + checkedBefore + ' 条勾选已被平台清空 → ' +
+            '判定「批量错误」已提交成功（耗时 ' + Math.round(elapsed / 1000) + 's；' +
+            '待判(0) 还剩 ' + stats.pendingValid + ' 条，状态码不参与判定）');
+          return true;
+        }
+        // ===== 兜底（只在宽限期之后，且日志会写明"主判据没出现"）=====
+        if (!inGrace) {
+          if (net) {
+            fellBackTo = '网络 2xx';
+            log('⚠️【兜底·网络】点击后已等 ' + Math.round(elapsed / 1000) + 's 仍未见"勾选被清空" → ' +
+              '改用网络信号：' + net.method + ' ' + net.url + ' → HTTP ' + net.status + '（' + net.ms + 'ms）');
+            if (!netDumpedOnce) {
+              netDumpedOnce = true;
+              log('📡 本次点击后的请求清单（便于把主判据收紧成精确接口匹配）：' + netTail(8));
+            }
+            return true;
           }
-          return true;
-        }
-        // ② 状态码：有效行里"未判定(0/空)"清零（平台允许时的老判据）
-        if (stats.valid === 0) {
-          log('⚠️ 该合集没有有效行（' + stats.notReady + ' 条全是 0 分/读不到）→ ' +
-            '视为「批量错误」这一步已完成，继续走查询刷新');
-          return true;
-        }
-        if (stats.pendingValid === 0) {
-          log('✅ 判错完成判定：有效行里已无"未判定(0/空)"的行（有效行已594 ' + stats.validWrong +
-            ' 条；' + Math.max(0, stats.valid - stats.validWrong) +
-            ' 条是 777/601 等已判定行，系统不会改其状态码）');
-          return true;
-        }
-        // ③ 勾选被平台清空 → 成功提交后的常见表现（与状态码无关）
-        if (selCleared && Date.now() - start > minSettleMs) {
-          log('✅ 点击前的 ' + checkedBefore + ' 条勾选已被平台清空 → 判定「批量错误」已提交成功' +
-            '（不依赖状态码；待判(0) 还剩 ' + stats.pendingValid + ' 条）');
-          return true;
-        }
-        // ④ 点击后转圈出现过并已结束 → 说明确实触发了异步提交（与状态码无关）
-        if (calmedAfterLoading && Date.now() - start > minSettleMs) {
-          log('✅ 点击后页面转圈出现过并已结束 → 判定「批量错误」已提交成功' +
-            '（不依赖状态码；待判(0) 还剩 ' + stats.pendingValid + ' 条）');
-          return true;
+          if (stats.valid === 0) {
+            fellBackTo = '无有效行';
+            log('⚠️【兜底】该合集没有有效行（' + stats.notReady + ' 条全是 0 分/读不到）且勾选未被清空 → ' +
+              '视为「批量错误」这一步已完成，继续走查询刷新');
+            return true;
+          }
+          if (stats.pendingValid === 0) {
+            fellBackTo = '待判(0)清零';
+            log('⚠️【兜底·状态码】未见"勾选被清空"，但有效行里已无"未判定(0/空)"的行 → 视为提交成功');
+            return true;
+          }
+          if (calmedAfterLoading) {
+            fellBackTo = '转圈出现过';
+            log('⚠️【兜底·转圈】未见"勾选被清空"，但点击后页面转圈出现过并已结束 → 视为提交成功');
+            return true;
+          }
         }
       }
 
       await retryTick(start, retried, R, '批量错误', expandedRow, '（判错等待中）');
       await delay(CONFIG.checkInterval);
     }
+    if (fellBackTo) log('（本轮最终用的是兜底信号：' + fellBackTo + '）');
     return false;
   }
 
@@ -1341,7 +1372,7 @@
       time: new Date().toLocaleString(),
       ts: Date.now(),
       script: '短剧审核9.2',
-      version: '9.2.3',
+      version: '9.2.4',
       childId: c.childId || '',                 // 子样本第一条 id（子样本第2列）
       childRowText: c.childRowText || '',
       parentId: meta.id,                        // 母本合集 id（仅作参考）
@@ -1674,30 +1705,37 @@
 
     // 批量错误（判错）——失败自动重试3次
     log('点击「批量错误」...');
-    installNetHook();            // 9.2.3：确保网络观察钩子已装（用于确认提交成功）
-    startLoadingWatch();         // 9.2.3：确保"转圈是否出现过"的观察已开
+    installNetHook();            // 9.2.3：确保网络观察钩子已装（仅作兜底/诊断）
+    startLoadingWatch();         // 9.2.3：确保"转圈是否出现过"的观察已开（仅作兜底）
     sawLoadingAt = 0;            // 9.2.3：重置"见过转圈"标记（观察器记过就不再检查，必须每次点击前清掉）
+    const graceMs = meta.isSlow ? CONFIG.selClearGraceMsSlow : CONFIG.selClearGraceMs;
+    log('判错成功【主判据】= 勾选被平台清空（点击前已勾选 ' + checked + ' 条）；' +
+      '宽限 ' + Math.round(graceMs / 1000) + 's 内只等它，之后才启用兜底信号（网络/状态码/转圈）');
     const clickT0 = Date.now();
     if (!(await clickRowButtonRetry(R, '批量错误', expandedRow, 3, 3000))) {
       log('批量错误提交失败（按钮不可用或弹窗未出现）');
       return { result: 'problem', mode: 2 };
     }
 
-    // 等响应：四路信号任一命中即算提交成功（网络 2xx / 待判(0)清零 / 勾选被清空 / 转圈出现过并结束）
+    // 等响应：主判据 = 勾选被清空；兜底 = 网络 2xx / 待判(0)清零 / 转圈出现过（宽限期后才启用）
     //   等待期间 30s/60s 会重试点击「批量错误」
     const judgeWait = meta.isSlow ? CONFIG.batchErrorWaitMaxSlow : CONFIG.batchErrorWaitMax;
-    const ok = await waitAllJudged(expandedRow, R, judgeWait, { clickT0: clickT0, checkedBefore: checked });
+    const ok = await waitAllJudged(expandedRow, R, judgeWait,
+      { clickT0: clickT0, checkedBefore: checked, graceMs: graceMs });
     if (!ok) {
       const last = getCodeStats(expandedRow);
       log('等待判错完成超时(' + Math.round(judgeWait / 1000) + 's，已含30s/60s两次重试)：' +
         '有效行里"待判(0/空)"还剩 ' + last.pendingValid + ' 条（有效行 ' + last.valid +
         ' 条，已594 ' + last.validWrong + '），状态码分布 ' + last.detail +
         (isLoading() ? '（页面仍有转圈）' : '') + '，判定该合集有问题');
-      log('🔍 超时诊断：网络信号=' + (recentSubmit(clickT0) ? '有' : '无') +
-        '｜勾选现在剩 ' + countCheckedChildRows(expandedRow) + ' 条（点击前 ' + checked + ' 条）' +
-        '｜转圈观察=' + (sawLoadingAt >= clickT0 ? '点后出现过' : '点后没见到'));
+      log('🔍 超时诊断（主判据=勾选被清空）：勾选现在剩 ' + countCheckedChildRows(expandedRow) +
+        ' 条（点击前 ' + checked + ' 条；表头全选=' +
+        (((expandedRow && expandedRow.querySelector(SELECTORS.childSelectAll)) || {}).checked ? '还勾着' : '已取消') +
+        '）→ 平台始终没清勾选；' +
+        '兜底信号：网络=' + (recentSubmit(clickT0) ? '有 2xx 提交' : '无') +
+        '｜待判(0)=' + last.pendingValid + ' 条｜转圈=' + (sawLoadingAt >= clickT0 ? '点后出现过' : '点后没见到'));
       log('📡 最近请求（点后）：' + (netTail(8) || '（没抓到任何请求——钩子可能没装上，看控制台自检）'));
-      return { result: 'problem', mode: 2, reason: '批量错误等待超时（四路信号都没命中）' };
+      return { result: 'problem', mode: 2, reason: '批量错误等待超时（勾选未被清空，兜底信号也没命中）' };
     }
     {
       const after = getCodeStats(expandedRow);
